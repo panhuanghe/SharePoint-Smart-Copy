@@ -35,6 +35,15 @@ public class SharePointService
         AutomaticDecompression   = System.Net.DecompressionMethods.All,
     }) { Timeout = TimeSpan.FromMinutes(30) };
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (string siteUrl, string listId, string listItemId)> _spIdsCache = new();
+    // Form digests are site-scoped and valid ~30 minutes; without this a folder-correction pass
+    // paid one _api/contextinfo POST per folder needing a CSOM write (thousands per run) where ~1
+    // per site would do. 20-minute TTL leaves margin below the ~30-minute server-side expiry.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (string digest, DateTimeOffset fetchedUtc)> _digestCache = new();
+    private static readonly TimeSpan DigestCacheLifetime = TimeSpan.FromMinutes(20);
+    // EnsureUser resolves a claims login to a user ID and registers it on the site if missing — the
+    // set of distinct author/editor emails across a library is typically tens, not one per folder.
+    // Keyed "{siteUrl}|{loginName}".
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int?> _ensureUserCache = new();
     // Deduplicates concurrent folder-creation calls for the same path segment.
     // Lazy<Task<string>> ensures only one Graph call is made per "{driveId}|{parentId}|{segment}"
     // key even when multiple parallel tasks race — all share the same Task and await its result.
@@ -424,14 +433,19 @@ public class SharePointService
     // ── Enumerate all sub-folders under a folder ──────────────────────────────
 
     public async IAsyncEnumerable<(string driveId, string itemId, string relativePath)>
-        EnumerateFoldersAsync(string driveId, string rootItemId, string basePath = "")
+        EnumerateFoldersAsync(string driveId, string rootItemId, string basePath = "",
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
+        // Previously took no CancellationToken at all: cancelling mid-walk on a large (3,000+
+        // folder) library left the button live but nothing actually stopped until the whole
+        // recursive walk finished on its own.
         var children = await GetChildrenAsync(driveId, rootItemId, string.Empty);
         foreach (var child in children.Where(c => c.Type == NodeType.Folder))
         {
+            ct.ThrowIfCancellationRequested();
             var childPath = string.IsNullOrEmpty(basePath) ? child.Name : $"{basePath}/{child.Name}";
             yield return (driveId, child.Id, childPath);
-            await foreach (var item in EnumerateFoldersAsync(driveId, child.Id, childPath))
+            await foreach (var item in EnumerateFoldersAsync(driveId, child.Id, childPath, ct))
                 yield return item;
         }
     }
@@ -544,16 +558,31 @@ public class SharePointService
     // Set type derived from it. See IsSpecialContainer.
     private const string DocumentSetContentTypeIdPrefix = "0x0120D520";
 
-    // Hidden list-item fields backing SharePoint's "Customize folder > color" feature. These
-    // internal names are UNCONFIRMED against a live tenant — best-guess names commonly cited for
-    // this feature as of 2026-07-25, not verified via a raw ListItemAllFields probe (see
-    // GetFolderCurrentMetadataAsync for the call shape a live-tenant check would use: same URL with
-    // no $select, grep the response for "Color"). Both reads and writes degrade gracefully if these
-    // are wrong or absent on a given tenant/rollout — a missing field just reads back null, and a
-    // failed color write only fails the color write (see PatchFolderColorViaCsomAsync), never the
-    // Author/Editor/Created/Modified correction it runs alongside.
+    // Hidden list-item fields backing SharePoint's "Customize folder > color" feature.
+    //
+    // `_ColorHex` ({3BDAB9AC-9E5D-44D4-BDE9-13B37E170618}, Hidden) is the value holder: despite the
+    // name it is Type="Text" holding a palette INDEX as a numeric string, "0".."15" (0/empty =
+    // yellow, 1 = dark red, … 15 = light pink); out-of-range values fall back to the default.
+    // `_ColorTag` ({76D13CD2-1BAE-45A5-8B74-545B87B65037}) is a related system column. Both are
+    // ReadOnlyField="TRUE" on current SharePoint Online, so they are READ here but never written —
+    // color is written through the supported /_api/foldercoloring/stampcolor endpoint instead (see
+    // StampFolderColorAsync). Neither name is verified against this tenant, so every read is built to
+    // be a no-op on failure rather than a regression:
+    //   • the REST fast-path read falls back to the same call without the color fields — a SharePoint
+    //     $select HARD-FAILS on an unknown column, and swallowing that would silently disable the
+    //     whole folder fast-path optimization
+    //   • the Graph read is best-effort in a try/catch; Graph's fieldValueSet is an OData open type,
+    //     so an unknown name there is silently omitted rather than an error
+    //   • color failures are reported separately from metadata failures so they don't pollute the
+    //     "could not correct metadata" diagnostics
+    //
+    // NAMING: OData forbids a leading '_' in a property name, so SharePoint surfaces these as
+    // `OData__ColorHex` in REST/Graph $select and JSON payloads, while CSOM SetFieldValue and
+    // ValidateUpdateListItem's FieldName take the raw internal name. Both forms are needed.
     private const string FolderColorTagFieldName = "_ColorTag";
-    private const string FolderColorHexFieldName = "_ColorHexValue";
+    private const string FolderColorHexFieldName = "_ColorHex";
+    private const string FolderColorTagODataName = "OData__ColorTag";
+    private const string FolderColorHexODataName = "OData__ColorHex";
 
     // Whether a folder-like DriveItem is a special container that must NOT be walked into as a
     // plain folder (its contents are handled by a server-side special-folder copy instead — see
@@ -576,16 +605,31 @@ public class SharePointService
         return ctId != null && ctId.StartsWith(DocumentSetContentTypeIdPrefix, StringComparison.OrdinalIgnoreCase);
     }
 
-    // Reads the two folder-color fields (see FolderColorTagFieldName/FolderColorHexFieldName) off
-    // an already-fetched DriveItem's expanded listItem.fields — returns (null, null) for a plain,
-    // uncolored folder or a tenant where the field doesn't exist, same "absent means no value, not
-    // an error" contract as GetFolderProgIdAsync.
+    // Reads the two folder-color fields (see FolderColorTagFieldName) off an already-fetched
+    // DriveItem's expanded listItem.fields — returns (null, null) for a plain, uncolored folder or a
+    // tenant where the field doesn't exist, same "absent means no value, not an error" contract as
+    // GetFolderProgIdAsync. Checks BOTH the OData-prefixed and raw internal names because it's
+    // unconfirmed which form Graph's fields bag keys these on, and tries a case-insensitive sweep as
+    // a last resort (AdditionalData uses an ordinal-comparer Dictionary). `_ColorHex` is an integer,
+    // so values are normalized via ToString() rather than assuming a JSON string.
     private static (string? colorTag, string? colorHex) GetFolderColorValues(DriveItem? item)
     {
         var additional = item?.ListItem?.Fields?.AdditionalData;
         if (additional == null) return (null, null);
-        string? colorTag = additional.TryGetValue(FolderColorTagFieldName, out var ct) && ct != null ? ct.ToString() : null;
-        string? colorHex = additional.TryGetValue(FolderColorHexFieldName, out var ch) && ch != null ? ch.ToString() : null;
+
+        string? Read(string odataName, string rawName)
+        {
+            if (additional.TryGetValue(odataName, out var v) && v != null) return v.ToString();
+            if (additional.TryGetValue(rawName, out var v2) && v2 != null) return v2.ToString();
+            foreach (var kv in additional)
+                if ((string.Equals(kv.Key, odataName, StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(kv.Key, rawName, StringComparison.OrdinalIgnoreCase)) && kv.Value != null)
+                    return kv.Value.ToString();
+            return null;
+        }
+
+        var colorTag = Read(FolderColorTagODataName, FolderColorTagFieldName);
+        var colorHex = Read(FolderColorHexODataName, FolderColorHexFieldName);
         return (string.IsNullOrEmpty(colorTag) ? null : colorTag, string.IsNullOrEmpty(colorHex) ? null : colorHex);
     }
 
@@ -708,8 +752,12 @@ public class SharePointService
 
     public async Task<List<DriveItemVersion>> GetVersionsAsync(string driveId, string itemId)
     {
+        // Only id/size/lastModifiedDateTime/lastModifiedBy are ever read off these (version replay in
+        // CopyService/MigrationJobService) — $select trims the rest of the full DriveItemVersion
+        // payload per version, per file.
         var all  = new List<DriveItemVersion>();
-        var page = await Graph.Drives[driveId].Items[itemId].Versions.GetAsync();
+        var page = await Graph.Drives[driveId].Items[itemId].Versions.GetAsync(cfg =>
+            cfg.QueryParameters.Select = ["id", "size", "lastModifiedDateTime", "lastModifiedBy"]);
         while (page != null)
         {
             all.AddRange(page.Value ?? []);
@@ -765,6 +813,13 @@ public class SharePointService
     // this pass doesn't use metadata), halving its Graph footprint vs a full metadata+versions fetch.
     // Used to size version-aware migration batches over a whole library (tens/hundreds of thousands of
     // files) without holding all metadata in memory. Items whose sub-request fails default to a count of 1.
+    //
+    // CURRENTLY UNCALLED anywhere in this codebase. Before wiring it up: it lacks the retry rounds,
+    // adaptive throttle-aware gate, and Throttled subscription its siblings (FetchBatchChunkAsync's
+    // callers) have, and the "default to 1 on failure" behavior is exactly the under-count
+    // BatchDownloadMetadataAsync's own comment warns about — "an incomplete cache would under-count
+    // a file's versions, and that file's batch could then exceed the SPMI entry ceiling and fail
+    // import." Harden it to match those siblings before any caller depends on it.
     public async Task<Dictionary<string, int>> FetchVersionCountsAsync(
         IReadOnlyList<(string driveId, string itemId)> items,
         int maxVersionsCap,
@@ -1133,15 +1188,25 @@ public class SharePointService
                     {
                         var (parsed, nextLink) = ParseBatchVersions(await versHttp.Content.ReadAsStringAsync(ct));
                         var vList = parsed;
+                        // A thrown page is already handled by the outer catch. A NULL page (Kiota's
+                        // representation of an empty/204 body) previously exited this loop silently
+                        // with whatever partial list had accumulated so far, and `versions` below
+                        // was still set from that partial list — the caller's own comment on
+                        // multiVersionItemIds warns exactly what this causes: an under-counted file
+                        // can then exceed the SPMI batch entry ceiling and fail import. Treat it the
+                        // same as a failure: leave `versions` null so this item is skipped below and
+                        // the caller falls back to an individual, complete fetch.
+                        bool pageMissing = false;
                         while (nextLink != null)
                         {
                             ct.ThrowIfCancellationRequested();
                             var page = await Graph.Drives[driveId].Items[itemId].Versions
                                 .WithUrl(nextLink).GetAsync(cancellationToken: ct);
-                            vList.AddRange(page?.Value ?? []);
-                            nextLink = page?.OdataNextLink;
+                            if (page == null) { pageMissing = true; break; }
+                            vList.AddRange(page.Value ?? []);
+                            nextLink = page.OdataNextLink;
                         }
-                        versions = SortVersions(vList);
+                        if (!pageMissing) versions = SortVersions(vList);
                     }
                     else NoteSubThrottle(versHttp);
                 }
@@ -1257,16 +1322,48 @@ public class SharePointService
 
     // ── Metadata ──────────────────────────────────────────────────────────────
 
-    public async Task<FileMetadata> GetFileMetadataAsync(string driveId, string itemId)
+    // includeFolderColor: opt IN to the extra listItem/fields expand that carries folder color.
+    // Defaults to FALSE deliberately — this method is on the per-FILE hot path (1-2 calls per file
+    // in Enhanced REST mode, so 100k+ per run), and folder color is meaningless for a file. Adding
+    // the expand unconditionally forced a server-side listItem join plus a fields projection on
+    // every file read, against this file's documented payload-minimization grain (see the $select
+    // comment above IsSpecialContainer, and the note there about a removed per-folder probe having
+    // been "the dominant hidden cost of the source scan"). Only folder callers pass true.
+    public async Task<FileMetadata> GetFileMetadataAsync(
+        string driveId, string itemId, bool includeFolderColor = false)
     {
-        var item = await Graph.Drives[driveId].Items[itemId].GetAsync(cfg =>
+        string[] select = ["createdDateTime", "lastModifiedDateTime", "createdBy", "lastModifiedBy", "size"];
+        DriveItem? item = null;
+        string? colorTag = null, colorHex = null;
+
+        if (includeFolderColor)
         {
-            cfg.QueryParameters.Select = ["createdDateTime", "lastModifiedDateTime", "createdBy", "lastModifiedBy", "size"];
-            // Only meaningful for folders (see FolderColorTagFieldName) — a plain file simply
-            // won't carry these fields, so this is a no-op read for every file this method serves.
-            cfg.QueryParameters.Expand = [$"listItem($expand=fields($select={FolderColorTagFieldName},{FolderColorHexFieldName}))"];
-        });
-        var (colorTag, colorHex) = GetFolderColorValues(item);
+            // Best-effort: the color field names are unverified (see FolderColorTagFieldName), and an
+            // unknown name inside a nested fields($select=...) may well be a 400 rather than a
+            // silently-omitted property. Never let that break the metadata read this method exists
+            // for — on ANY failure, fall through to the plain request below.
+            try
+            {
+                item = await Graph.Drives[driveId].Items[itemId].GetAsync(cfg =>
+                {
+                    // `listItem` is repeated in $select alongside the $expand — the common working
+                    // idiom, and harmless. Graph's fieldValueSet is an OData OPEN type, so an unknown
+                    // color field name here is silently omitted rather than erroring (unlike a REST
+                    // $select, which hard-fails — see GetFolderCurrentMetadataAsync). The try/catch
+                    // remains for transport-level failures.
+                    cfg.QueryParameters.Select = [.. select, "listItem"];
+                    cfg.QueryParameters.Expand = [$"listItem($expand=fields($select={FolderColorTagODataName},{FolderColorHexODataName}))"];
+                });
+                (colorTag, colorHex) = GetFolderColorValues(item);
+            }
+            catch
+            {
+                item = null;
+            }
+        }
+
+        item ??= await Graph.Drives[driveId].Items[itemId].GetAsync(cfg =>
+            cfg.QueryParameters.Select = select);
 
         return new FileMetadata
         {
@@ -1314,14 +1411,25 @@ public class SharePointService
         // Library root folder.
         try
         {
-            var root = await Graph.Drives[rootDriveId].Root.GetAsync(cfg =>
+            string[] rootSelect = ["id", "createdDateTime", "lastModifiedDateTime", "createdBy", "lastModifiedBy"];
+            DriveItem? root = null;
+            string? rootColorTag = null, rootColorHex = null;
+            // Same best-effort contract as GetFileMetadataAsync: an unverified color field must never
+            // cost us the root folder's dates/authorship.
+            try
             {
-                cfg.QueryParameters.Select = ["id", "createdDateTime", "lastModifiedDateTime", "createdBy", "lastModifiedBy"];
-                cfg.QueryParameters.Expand = [$"listItem($expand=fields($select={FolderColorTagFieldName},{FolderColorHexFieldName}))"];
-            }, cancellationToken: ct);
+                root = await Graph.Drives[rootDriveId].Root.GetAsync(cfg =>
+                {
+                    cfg.QueryParameters.Select = [.. rootSelect, "listItem"];
+                    cfg.QueryParameters.Expand = [$"listItem($expand=fields($select={FolderColorTagODataName},{FolderColorHexODataName}))"];
+                }, cancellationToken: ct);
+                (rootColorTag, rootColorHex) = GetFolderColorValues(root);
+            }
+            catch { root = null; }
+            root ??= await Graph.Drives[rootDriveId].Root.GetAsync(cfg =>
+                cfg.QueryParameters.Select = rootSelect, cancellationToken: ct);
             if (root != null)
             {
-                var (rootColorTag, rootColorHex) = GetFolderColorValues(root);
                 result[string.Empty] = new FileMetadata
                 {
                     CreatedDateTime  = root.CreatedDateTime,
@@ -1355,7 +1463,8 @@ public class SharePointService
                         currentId = folderItem?.ParentReference?.Id;
                     }
                     if (string.IsNullOrEmpty(currentId)) return;
-                    var metadata = await GetFileMetadataAsync(f.driveId, currentId);
+                    // currentId is a FOLDER here, so opt into the color read (see GetFileMetadataAsync).
+                    var metadata = await GetFileMetadataAsync(f.driveId, currentId, includeFolderColor: true);
                     var progId   = await GetFolderProgIdAsync(f.driveId, currentId);
                     result[f.folderKey] = string.IsNullOrEmpty(progId) ? metadata : new FileMetadata
                     {
@@ -1488,6 +1597,9 @@ public class SharePointService
     // proceed under Skip/IfNewer.
     public async Task<bool> ChildExistsAsync(string driveId, string parentItemId, string name)
     {
+        // Only a genuine 404 may map to false ("doesn't exist") — same reasoning as GetFileInfoAsync:
+        // swallowing every failure here made a transient error (post-retry 429, network blip) read as
+        // "not there", which in Overwrite/Skip mode proceeded as if the target were free to use.
         try
         {
             var existing = await Graph.Drives[driveId].Items[parentItemId]
@@ -1495,7 +1607,10 @@ public class SharePointService
                 .GetAsync(cfg => cfg.QueryParameters.Select = ["id"]);
             return existing?.Id != null;
         }
-        catch { return false; }
+        catch (Microsoft.Graph.Models.ODataErrors.ODataError ex) when (ex.ResponseStatusCode == 404)
+        {
+            return false;
+        }
     }
 
     // Deletes a child with this exact name directly under the given parent, if one exists — Graph's
@@ -1503,18 +1618,30 @@ public class SharePointService
     // 409s with nameAlreadyExists), so Overwrite mode for a native folder copy has to clear the old
     // item first. Mirrors the existing-item check CreatePageStubAsync already uses for pages.
     // Returns true if something was deleted.
+    //
+    // Only a genuine 404 on the existence check may be swallowed as "nothing to delete" — any other
+    // failure (including one from the DeleteAsync call itself, e.g. a locked/checked-out OneNote
+    // notebook or Document Set) is thrown, not reported as false. Swallowing it here previously meant
+    // the caller proceeded as if the target were clear, CopyFolderNativeAsync then failed with
+    // "nameAlreadyExists", and the real cause (the delete failing, often for an access/lock reason)
+    // never surfaced — the user saw a confusing "already exists" instead.
     public async Task<bool> DeleteChildIfExistsAsync(string driveId, string parentItemId, string name)
     {
+        string? existingId;
         try
         {
             var existing = await Graph.Drives[driveId].Items[parentItemId]
                 .ItemWithPath(Uri.EscapeDataString(name))
                 .GetAsync(cfg => cfg.QueryParameters.Select = ["id"]);
-            if (existing?.Id == null) return false;
-            await Graph.Drives[driveId].Items[existing.Id].DeleteAsync();
-            return true;
+            existingId = existing?.Id;
         }
-        catch { return false; }
+        catch (Microsoft.Graph.Models.ODataErrors.ODataError ex) when (ex.ResponseStatusCode == 404)
+        {
+            return false;
+        }
+        if (existingId == null) return false;
+        await Graph.Drives[driveId].Items[existingId].DeleteAsync();
+        return true;
     }
 
     // Copies a special folder (see SourceFileEntry.IsSpecialFolder) as a single server-side Graph
@@ -1612,7 +1739,7 @@ public class SharePointService
     }
 
     public async Task<(string siteUrl, string listId, string listItemId)?> GetSharePointIdsAsync(
-        string driveId, string itemId)
+        string driveId, string itemId, CancellationToken ct = default)
     {
         var key = $"{driveId}|{itemId}";
         if (_spIdsCache.TryGetValue(key, out var cached))
@@ -1623,12 +1750,12 @@ public class SharePointService
 
         for (int attempt = 0; attempt < 3; attempt++)
         {
-            if (attempt > 0) await Task.Delay(attempt * 1500);
+            if (attempt > 0) await Task.Delay(attempt * 1500, ct);
             try
             {
                 System.Diagnostics.Debug.WriteLine($"[GetSPIds] attempt {attempt + 1}/3 for itemId={itemId}");
                 var item = await Graph.Drives[driveId].Items[itemId].GetAsync(cfg =>
-                    cfg.QueryParameters.Select = ["sharepointIds"]);
+                    cfg.QueryParameters.Select = ["sharepointIds"], cancellationToken: ct);
 
                 var ids = item?.SharepointIds;
                 if (ids?.SiteUrl == null || ids.ListId == null || ids.ListItemId == null)
@@ -1641,6 +1768,10 @@ public class SharePointService
                 var result = (ids.SiteUrl, ids.ListId, ids.ListItemId);
                 _spIdsCache[key] = result;
                 return result;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw; // genuine cancellation — don't retry it 3 times before giving up
             }
             catch (Exception ex)
             {
@@ -1674,16 +1805,21 @@ public class SharePointService
     // was tried first and kept since it now matches the proven file mechanism exactly, but it's
     // unconfirmed whether the nested GetFolderById(...)/ListItemAllFields/ValidateUpdateListItem()
     // path would have worked fine with the corrected Person format too.
-    public async Task<string?> PatchFolderMetadataAsync(
+    // Returns (Error, ColorWarning). ColorWarning is set when dates/authorship were applied fine but
+    // the folder color could not be — kept separate so an unsupported or absent color field (the
+    // names are unverified; Microsoft documents no supported write API for folder color at all) never
+    // inflates the "could not correct metadata" diagnostics the caller reports.
+    public async Task<(string? Error, string? ColorWarning)> PatchFolderMetadataAsync(
         string siteUrl, string listId, string folderUniqueId,
         DateTimeOffset? createdDateTime, DateTimeOffset? modifiedDateTime,
         string? createdByEmail, string? modifiedByEmail,
-        string? colorTag = null, string? colorHex = null)
+        string? colorTag = null, string? colorHex = null,
+        string? folderServerRelativeUrl = null)
     {
         if (createdDateTime == null && modifiedDateTime == null &&
             string.IsNullOrEmpty(createdByEmail) && string.IsNullOrEmpty(modifiedByEmail) &&
             string.IsNullOrEmpty(colorTag) && string.IsNullOrEmpty(colorHex))
-            return null;
+            return (null, null);
 
         // FAST PATH (added 2026-07-10) — the whole-tree repair fix made this correction pass run
         // unconditionally on EVERY run, even an all-skip Copy-If-Newer re-run, because that's the
@@ -1713,7 +1849,7 @@ public class SharePointService
                         && (string.IsNullOrEmpty(colorHex) || string.Equals(actualColorHex, colorHex, StringComparison.OrdinalIgnoreCase));
             needsColorWrite = !colorOk;
             if (authorOk && editorOk && createdOk && modifiedOk && colorOk)
-                return null; // already correct — nothing to write
+                return (null, null); // already correct — nothing to write
         }
         else
         {
@@ -1729,7 +1865,7 @@ public class SharePointService
             }, siteUrl);
             var idBody = await idResponse.Content.ReadAsStringAsync();
             if (!idResponse.IsSuccessStatusCode)
-                return $"Could not resolve folder's list item ID: HTTP {(int)idResponse.StatusCode}: {idBody[..Math.Min(idBody.Length, 200)]}";
+                return ($"Could not resolve folder's list item ID: HTTP {(int)idResponse.StatusCode}: {idBody[..Math.Min(idBody.Length, 200)]}", null);
             try
             {
                 using var idDoc = JsonDocument.Parse(idBody);
@@ -1739,7 +1875,7 @@ public class SharePointService
             }
             catch (Exception ex)
             {
-                return $"Could not parse folder's list item ID from '{idBody[..Math.Min(idBody.Length, 100)]}': {ex.Message}";
+                return ($"Could not parse folder's list item ID from '{idBody[..Math.Min(idBody.Length, 100)]}': {ex.Message}", null);
             }
         }
 
@@ -1791,7 +1927,7 @@ public class SharePointService
         }
 
         if (createdById == null && modifiedById == null && createdDateTime == null && modifiedDateTime == null && !needsColorWrite)
-            return skipped.Count > 0 ? $"Nothing to write — skipped: {string.Join(", ", skipped)}" : null;
+            return (skipped.Count > 0 ? $"Nothing to write — skipped: {string.Join(", ", skipped)}" : null, null);
 
         // TENTH attempt 2026-07-09 — REST is now fully exhausted (Person-field format x2, REST path
         // x2, bNewDocumentUpdate x2, field combination x2 — nine variations, all producing the
@@ -1805,109 +1941,28 @@ public class SharePointService
         // REST's ValidateUpdateListItem has NO equivalent to UpdateOverwriteVersion — only CSOM
         // exposes it — which is exactly why every REST permutation failed identically no matter what
         // was changed in the request. Switched the actual field write to a CSOM ProcessQuery call.
-        string? csomError = await PatchFolderViaCsomAsync(
+        // Color goes FIRST, via the supported foldercoloring endpoint (see StampFolderColorAsync).
+        // It is a list-item write, so it stamps Editor = calling account and Modified = now — doing it
+        // before the correction below means those side effects get overwritten. The colour fields
+        // themselves are read-only, so they cannot ride in the CSOM batch.
+        string? colorWarning = null;
+        if (needsColorWrite && !string.IsNullOrEmpty(colorHex) && !string.IsNullOrEmpty(folderServerRelativeUrl))
+        {
+            var stampError = await StampFolderColorAsync(siteUrl, folderServerRelativeUrl!, colorHex!);
+            if (stampError != null) colorWarning = $"folder color not applied — {stampError}";
+        }
+
+        var csomError = await PatchFolderViaCsomAsync(
             siteUrl, listId, folderItemId, createdById, modifiedById, createdDateTime, modifiedDateTime,
             resolvedCreatedBy, resolvedModifiedBy);
 
-        // Color is written via a SEPARATE CSOM call, deliberately decoupled from the Author/Editor/
-        // date UpdateOverwriteVersion() call above: color isn't a Person field so it doesn't need
-        // that special update mode, and keeping it separate means a wrong/unrecognized field name
-        // (see FolderColorTagFieldName's doc comment) only ever fails the color write, never the
-        // date/authorship correction this method exists for.
-        string? colorError = needsColorWrite
-            ? await PatchFolderColorViaCsomAsync(siteUrl, listId, folderItemId, colorTag, colorHex)
-            : null;
-
-        // The write(s) may have succeeded, but still report a failure if anything had to be
-        // skipped or errored — a folder is only partially corrected otherwise (e.g. date fixed,
-        // that one person field still shows the importing account), and that's not "no error".
-        var problems = new List<string>();
-        if (csomError != null) problems.Add(csomError);
-        if (colorError != null) problems.Add(colorError);
-        if (skipped.Count > 0) problems.Add($"skipped: {string.Join(", ", skipped)}");
-        return problems.Count > 0 ? string.Join(" | ", problems) : null;
-    }
-
-    // Writes a folder's color field(s) via CSOM's ProcessQuery endpoint, using plain Update() —
-    // color isn't a Person field, so it doesn't need PatchFolderViaCsomAsync's UpdateOverwriteVersion()
-    // mode. Deliberately a separate ProcessQuery call from the date/authorship patch: a wrong or
-    // unrecognized internal field name (see FolderColorTagFieldName's doc comment — these names are
-    // unconfirmed against a live tenant) fails only this call, never the date/authorship correction
-    // PatchFolderMetadataAsync exists for.
-    private async Task<string?> PatchFolderColorViaCsomAsync(
-        string siteUrl, string listId, int itemId, string? colorTag, string? colorHex)
-    {
-        if (string.IsNullOrEmpty(colorTag) && string.IsNullOrEmpty(colorHex))
-            return null;
-
-        string? digest = await GetFormDigestAsync(siteUrl);
-        if (digest == null)
-            return "Could not obtain a request digest for the folder color CSOM call";
-
-        const string clientContextTypeId = "{3747adcd-a3c3-41b9-bfab-4a64dd2f1e0a}";
-        var objectPaths = new StringBuilder();
-        objectPaths.Append($"<StaticProperty Id=\"1\" TypeId=\"{clientContextTypeId}\" Name=\"Current\" />");
-        objectPaths.Append("<Property Id=\"2\" ParentId=\"1\" Name=\"Web\" />");
-        objectPaths.Append("<Property Id=\"3\" ParentId=\"2\" Name=\"Lists\" />");
-        objectPaths.Append($"<Method Id=\"4\" ParentId=\"3\" Name=\"GetById\"><Parameters><Parameter Type=\"Guid\">{listId}</Parameter></Parameters></Method>");
-        objectPaths.Append($"<Method Id=\"5\" ParentId=\"4\" Name=\"GetItemById\"><Parameters><Parameter Type=\"Number\">{itemId}</Parameter></Parameters></Method>");
-
-        var actions = new StringBuilder();
-        int nextId = 10;
-        void SetStringField(string fieldName, string value)
-        {
-            actions.Append($"<Method Name=\"SetFieldValue\" Id=\"{nextId++}\" ObjectPathId=\"5\"><Parameters>" +
-                $"<Parameter Type=\"String\">{System.Security.SecurityElement.Escape(fieldName)}</Parameter>" +
-                $"<Parameter Type=\"String\">{System.Security.SecurityElement.Escape(value)}</Parameter>" +
-                "</Parameters></Method>");
-        }
-        if (!string.IsNullOrEmpty(colorTag)) SetStringField(FolderColorTagFieldName, colorTag);
-        if (!string.IsNullOrEmpty(colorHex)) SetStringField(FolderColorHexFieldName, colorHex);
-        actions.Append($"<Method Name=\"Update\" Id=\"{nextId++}\" ObjectPathId=\"5\" />");
-
-        var requestXml =
-            "<Request AddExpandoFieldTypeSuffix=\"true\" SchemaVersion=\"15.0.0.0\" LibraryVersion=\"16.0.0.0\" " +
-            "ApplicationName=\"SharePointSmartCopy\" xmlns=\"http://schemas.microsoft.com/sharepoint/clientquery/2009\">" +
-            $"<Actions>{actions}</Actions><ObjectPaths>{objectPaths}</ObjectPaths></Request>";
-
-        try
-        {
-            var url = $"{siteUrl.TrimEnd('/')}/_vti_bin/client.svc/ProcessQuery";
-            using var response = await SendSharePointRequestAsync(token =>
-            {
-                var r = new HttpRequestMessage(HttpMethod.Post, url);
-                r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                r.Headers.Add("X-RequestDigest", digest);
-                r.Headers.Accept.ParseAdd("application/json");
-                r.Content = new StringContent(requestXml, System.Text.Encoding.UTF8, "text/xml");
-                return r;
-            }, siteUrl);
-
-            var body = await response.Content.ReadAsStringAsync();
-            if (!response.IsSuccessStatusCode)
-                return $"folder color HTTP {(int)response.StatusCode}: {body[..Math.Min(body.Length, 300)]}";
-
-            using var doc = JsonDocument.Parse(body);
-            if (doc.RootElement.ValueKind == JsonValueKind.Array && doc.RootElement.GetArrayLength() > 0)
-            {
-                var first = doc.RootElement[0];
-                if (first.ValueKind == JsonValueKind.Object &&
-                    first.TryGetProperty("ErrorInfo", out var errInfo) &&
-                    errInfo.ValueKind == JsonValueKind.Object)
-                {
-                    var msg = errInfo.TryGetProperty("ErrorMessage", out var m) ? m.GetString() : "unknown CSOM error";
-                    // A wrong/unrecognized field name is expected here on a tenant where
-                    // FolderColorTagFieldName/FolderColorHexFieldName don't match reality — this is
-                    // deliberately non-fatal to the caller's overall date/authorship correction.
-                    return $"folder color not applied — {msg}";
-                }
-            }
-            return null;
-        }
-        catch (Exception ex)
-        {
-            return $"folder color CSOM exception: {ex.Message}";
-        }
+        // The write may have succeeded, but still report a failure if a person field had to be
+        // skipped up front — the folder is only partially corrected (date fixed, that one person
+        // field still shows the importing account), and that's not "no error". Color is reported
+        // separately so an unsupported/absent color field never counts as a metadata failure.
+        if (csomError != null)
+            return (csomError + (skipped.Count > 0 ? $" | skipped: {string.Join(", ", skipped)}" : ""), colorWarning);
+        return (skipped.Count > 0 ? $"Partially corrected — skipped: {string.Join(", ", skipped)}" : null, colorWarning);
     }
 
     // Sets a folder's Author/Editor/Created/Modified via CSOM's ProcessQuery endpoint, using
@@ -1916,6 +1971,11 @@ public class SharePointService
     // explicitly-set Editor/Author value instead of silently ignoring it (unlike SystemUpdate(),
     // confirmed unable to set Editor per Microsoft Q&A 914732 and PnP-PowerShell#2016). REST's
     // ValidateUpdateListItem has no equivalent mode, which is why it could never do this.
+    //
+    // Deliberately does NOT carry folder color: the color fields are read-only, so color is applied
+    // separately (and EARLIER) via StampFolderColorAsync. Keeping it out matters — ProcessQuery
+    // aborts at the first failing action, so one rejected color field here would take the whole
+    // date/authorship write down with it.
     private async Task<string?> PatchFolderViaCsomAsync(
         string siteUrl, string listId, int itemId, int? authorUserId, int? editorUserId,
         DateTimeOffset? created, DateTimeOffset? modified,
@@ -1938,90 +1998,162 @@ public class SharePointService
         objectPaths.Append($"<Method Id=\"4\" ParentId=\"3\" Name=\"GetById\"><Parameters><Parameter Type=\"Guid\">{listId}</Parameter></Parameters></Method>");
         objectPaths.Append($"<Method Id=\"5\" ParentId=\"4\" Name=\"GetItemById\"><Parameters><Parameter Type=\"Number\">{itemId}</Parameter></Parameters></Method>");
 
-        var actions = new StringBuilder();
-        int nextId = 10;
-        void SetFieldValueLiteral(string fieldName, string xmlValue)
+        string BuildRequestXml()
         {
-            actions.Append($"<Method Name=\"SetFieldValue\" Id=\"{nextId++}\" ObjectPathId=\"5\"><Parameters>" +
-                $"<Parameter Type=\"String\">{System.Security.SecurityElement.Escape(fieldName)}</Parameter>{xmlValue}" +
-                "</Parameters></Method>");
-        }
-        // FieldUserValue is a CSOM "ValueObject", not a server-tracked object — it's passed INLINE
-        // as a typed Parameter directly in the method call (a <Parameter TypeId="..."><Property .../>
-        // </Parameter> block), never via a separate <Constructor> ObjectPath + SetProperty pair (that
-        // pattern is for real objects with server-side identity, which a plain value type isn't).
-        // CORRECTED 2026-07-09 after "Cannot find stub for type" — the GUID itself was right, the
-        // Constructor-based usage of it was wrong.
-        void SetPersonField(string fieldName, int userId)
-        {
-            SetFieldValueLiteral(fieldName,
-                $"<Parameter TypeId=\"{fieldUserValueTypeId}\"><Property Name=\"LookupId\" Type=\"Int32\">{userId}</Property></Parameter>");
-        }
-
-        if (authorUserId.HasValue) SetPersonField("Author", authorUserId.Value);
-        if (editorUserId.HasValue) SetPersonField("Editor", editorUserId.Value);
-        if (created.HasValue)
-            SetFieldValueLiteral("Created", $"<Parameter Type=\"DateTime\">{created.Value.ToUniversalTime():yyyy-MM-ddTHH:mm:ssZ}</Parameter>");
-        if (modified.HasValue)
-            SetFieldValueLiteral("Modified", $"<Parameter Type=\"DateTime\">{modified.Value.ToUniversalTime():yyyy-MM-ddTHH:mm:ssZ}</Parameter>");
-        actions.Append($"<Method Name=\"UpdateOverwriteVersion\" Id=\"{nextId++}\" ObjectPathId=\"5\" />");
-
-        var requestXml =
-            "<Request AddExpandoFieldTypeSuffix=\"true\" SchemaVersion=\"15.0.0.0\" LibraryVersion=\"16.0.0.0\" " +
-            "ApplicationName=\"SharePointSmartCopy\" xmlns=\"http://schemas.microsoft.com/sharepoint/clientquery/2009\">" +
-            $"<Actions>{actions}</Actions><ObjectPaths>{objectPaths}</ObjectPaths></Request>";
-
-        try
-        {
-            var url = $"{siteUrl.TrimEnd('/')}/_vti_bin/client.svc/ProcessQuery";
-            using var response = await SendSharePointRequestAsync(token =>
+            var actions = new StringBuilder();
+            int nextId = 10;
+            void SetFieldValueLiteral(string fieldName, string xmlValue)
             {
-                var r = new HttpRequestMessage(HttpMethod.Post, url);
-                r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                r.Headers.Add("X-RequestDigest", digest);
-                r.Headers.Accept.ParseAdd("application/json");
-                r.Content = new StringContent(requestXml, System.Text.Encoding.UTF8, "text/xml");
-                return r;
-            }, siteUrl);
+                actions.Append($"<Method Name=\"SetFieldValue\" Id=\"{nextId++}\" ObjectPathId=\"5\"><Parameters>" +
+                    $"<Parameter Type=\"String\">{System.Security.SecurityElement.Escape(fieldName)}</Parameter>{xmlValue}" +
+                    "</Parameters></Method>");
+            }
+            // FieldUserValue is a CSOM "ValueObject", not a server-tracked object — it's passed INLINE
+            // as a typed Parameter directly in the method call (a <Parameter TypeId="..."><Property .../>
+            // </Parameter> block), never via a separate <Constructor> ObjectPath + SetProperty pair (that
+            // pattern is for real objects with server-side identity, which a plain value type isn't).
+            // CORRECTED 2026-07-09 after "Cannot find stub for type" — the GUID itself was right, the
+            // Constructor-based usage of it was wrong.
+            void SetPersonField(string fieldName, int userId)
+            {
+                SetFieldValueLiteral(fieldName,
+                    $"<Parameter TypeId=\"{fieldUserValueTypeId}\"><Property Name=\"LookupId\" Type=\"Int32\">{userId}</Property></Parameter>");
+            }
 
-            var body = await response.Content.ReadAsStringAsync();
-            if (!response.IsSuccessStatusCode)
-                return $"CSOM ProcessQuery HTTP {(int)response.StatusCode}: {body[..Math.Min(body.Length, 300)]}";
+            if (authorUserId.HasValue) SetPersonField("Author", authorUserId.Value);
+            if (editorUserId.HasValue) SetPersonField("Editor", editorUserId.Value);
+            if (created.HasValue)
+                SetFieldValueLiteral("Created", $"<Parameter Type=\"DateTime\">{created.Value.ToUniversalTime():yyyy-MM-ddTHH:mm:ssZ}</Parameter>");
+            if (modified.HasValue)
+                SetFieldValueLiteral("Modified", $"<Parameter Type=\"DateTime\">{modified.Value.ToUniversalTime():yyyy-MM-ddTHH:mm:ssZ}</Parameter>");
+            actions.Append($"<Method Name=\"UpdateOverwriteVersion\" Id=\"{nextId++}\" ObjectPathId=\"5\" />");
 
-            // ProcessQuery's response is a flat JSON array: the first element carries ErrorInfo
-            // (null on success), interleaved afterward with [actionId, resultValue] pairs for any
-            // action that returns data (none of ours do — SetFieldValue/UpdateOverwriteVersion are
-            // void). We only need to check that first element for a non-null ErrorInfo.
+            return "<Request AddExpandoFieldTypeSuffix=\"true\" SchemaVersion=\"15.0.0.0\" LibraryVersion=\"16.0.0.0\" " +
+                "ApplicationName=\"SharePointSmartCopy\" xmlns=\"http://schemas.microsoft.com/sharepoint/clientquery/2009\">" +
+                $"<Actions>{actions}</Actions><ObjectPaths>{objectPaths}</ObjectPaths></Request>";
+        }
+
+        // Returns null on success, else an error string.
+        async Task<string?> SendAsync(string requestXml)
+        {
             try
             {
-                using var doc = JsonDocument.Parse(body);
-                if (doc.RootElement.ValueKind == JsonValueKind.Array && doc.RootElement.GetArrayLength() > 0)
+                var url = $"{siteUrl.TrimEnd('/')}/_vti_bin/client.svc/ProcessQuery";
+                using var response = await SendSharePointRequestAsync(token =>
                 {
-                    var first = doc.RootElement[0];
-                    if (first.ValueKind == JsonValueKind.Object &&
-                        first.TryGetProperty("ErrorInfo", out var errInfo) &&
-                        errInfo.ValueKind == JsonValueKind.Object)
+                    var r = new HttpRequestMessage(HttpMethod.Post, url);
+                    r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                    r.Headers.Add("X-RequestDigest", digest);
+                    r.Headers.Accept.ParseAdd("application/json");
+                    r.Content = new StringContent(requestXml, System.Text.Encoding.UTF8, "text/xml");
+                    return r;
+                }, siteUrl);
+
+                var body = await response.Content.ReadAsStringAsync();
+                if (!response.IsSuccessStatusCode)
+                    return $"CSOM ProcessQuery HTTP {(int)response.StatusCode}: {body[..Math.Min(body.Length, 300)]}";
+
+                // ProcessQuery's response is a flat JSON array: the first element carries ErrorInfo
+                // (null on success), interleaved afterward with [actionId, resultValue] pairs for any
+                // action that returns data (none of ours do — SetFieldValue/UpdateOverwriteVersion are
+                // void). ProcessQuery aborts at the first failing action and reports it there, so that
+                // first element is sufficient.
+                try
+                {
+                    using var doc = JsonDocument.Parse(body);
+                    if (doc.RootElement.ValueKind == JsonValueKind.Array && doc.RootElement.GetArrayLength() > 0)
                     {
-                        var msg = errInfo.TryGetProperty("ErrorMessage", out var m) ? m.GetString() : "unknown CSOM error";
-                        var code = errInfo.TryGetProperty("ErrorCode", out var c) ? c.ToString() : "?";
-                        return $"CSOM error (code {code}): {msg}";
+                        var first = doc.RootElement[0];
+                        if (first.ValueKind == JsonValueKind.Object &&
+                            first.TryGetProperty("ErrorInfo", out var errInfo) &&
+                            errInfo.ValueKind == JsonValueKind.Object)
+                        {
+                            var msg = errInfo.TryGetProperty("ErrorMessage", out var m) ? m.GetString() : "unknown CSOM error";
+                            var code = errInfo.TryGetProperty("ErrorCode", out var c) ? c.ToString() : "?";
+                            return $"CSOM error (code {code}): {msg}";
+                        }
                     }
                 }
+                catch (Exception ex)
+                {
+                    return $"Could not parse CSOM response: {ex.Message} | body: {body[..Math.Min(body.Length, 300)]}";
+                }
+                return null;
             }
             catch (Exception ex)
             {
-                return $"Could not parse CSOM response: {ex.Message} | body: {body[..Math.Min(body.Length, 300)]}";
+                return $"CSOM exception: {ex.Message}";
             }
-
-            // As with the REST path, a clean response still isn't proof the Person fields actually
-            // persisted — read the item back and compare.
-            return (authorUserId.HasValue || editorUserId.HasValue)
-                ? await VerifyFolderPersonFieldsAsync(siteUrl, listId, itemId, expectedAuthorEmail, expectedEditorEmail)
-                : null;
         }
+
+        var error = await SendAsync(BuildRequestXml());
+        if (error != null)
+            return error;
+
+        // As with the REST path, a clean response still isn't proof the Person fields actually
+        // persisted — read the item back and compare.
+        return (authorUserId.HasValue || editorUserId.HasValue)
+            ? await VerifyFolderPersonFieldsAsync(siteUrl, listId, itemId, expectedAuthorEmail, expectedEditorEmail)
+            : null;
+    }
+
+    // Applies a folder's color via SharePoint's dedicated folder-coloring endpoint — the SUPPORTED
+    // write path, and the one SharePoint's own UI uses. The `_ColorHex`/`_ColorTag` list fields are
+    // both ReadOnlyField="TRUE" on current SharePoint Online, so writing them through CSOM
+    // SetFieldValue or ValidateUpdateListItem is rejected; cli-microsoft365 moved to this endpoint for
+    // exactly that reason. `colorHex` is a palette INDEX as a string, "0".."15" (0/empty = yellow,
+    // 1 = dark red, … 15 = light pink) — not an RGB value, despite the name. Out-of-range values
+    // silently fall back to the default.
+    //
+    // MUST be called BEFORE the Created/Modified/Author/Editor correction for the same folder: this
+    // is a write to the folder's list item, so it stamps Editor = calling account and Modified = now.
+    // Running it first means the metadata correction that follows overwrites those side effects.
+    // Ordering it the other way round is the bug that shipped in the first version of this feature.
+    //
+    // Takes the folder's SERVER-RELATIVE URL (e.g. /sites/Team/Shared Documents/Reports), not a GUID
+    // or item id — DecodedUrl is a path-based parameter. Returns null on success, else an error string;
+    // callers treat a failure as non-fatal (color is cosmetic, and this endpoint is undocumented).
+    public async Task<string?> StampFolderColorAsync(
+        string siteUrl, string serverRelativeFolderUrl, string colorHex, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(colorHex)) return null;
+
+        try
+        {
+            // DecodedUrl is passed as an OData alias (@a1) rather than inline so that folder names
+            // containing '#', '%', '+', '&' or a single quote can't break the request — the same
+            // hazard the rest of this file avoids by staying ID-based. The alias VALUE is a quoted
+            // OData string literal, so embedded single quotes are doubled, then URL-encoded.
+            var literal = "'" + serverRelativeFolderUrl.Replace("'", "''") + "'";
+            var url = $"{siteUrl.TrimEnd('/')}/_api/foldercoloring/stampcolor(DecodedUrl=@a1)" +
+                      $"?@a1={Uri.EscapeDataString(literal)}";
+            var payload = JsonSerializer.Serialize(new { coloringInformation = new { ColorHex = colorHex } });
+
+            string? digest = await GetFormDigestAsync(siteUrl);
+
+            using var response = await SendSharePointRequestAsync(token =>
+            {
+                var r = new HttpRequestMessage(HttpMethod.Post, url)
+                {
+                    Content = new StringContent(payload, System.Text.Encoding.UTF8, "application/json")
+                };
+                r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                r.Headers.Accept.ParseAdd("application/json;odata=nometadata");
+                if (digest != null) r.Headers.Add("X-RequestDigest", digest);
+                return r;
+            }, siteUrl, cancellationToken: ct);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var body = await response.Content.ReadAsStringAsync(ct);
+                return $"stampcolor HTTP {(int)response.StatusCode}: {body[..Math.Min(body.Length, 300)]}";
+            }
+            return null;
+        }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
-            return $"CSOM exception: {ex.Message}";
+            return $"stampcolor exception: {ex.Message}";
         }
     }
 
@@ -2029,6 +2161,10 @@ public class SharePointService
     // even when authenticating with an OAuth bearer token (unlike REST endpoints, which don't need it).
     private async Task<string?> GetFormDigestAsync(string siteUrl)
     {
+        if (_digestCache.TryGetValue(siteUrl, out var cached) &&
+            DateTimeOffset.UtcNow - cached.fetchedUtc < DigestCacheLifetime)
+            return cached.digest;
+
         try
         {
             var url = $"{siteUrl.TrimEnd('/')}/_api/contextinfo";
@@ -2043,10 +2179,11 @@ public class SharePointService
             if (!response.IsSuccessStatusCode) return null;
             var body = await response.Content.ReadAsStringAsync();
             using var doc = JsonDocument.Parse(body);
-            if (doc.RootElement.TryGetProperty("FormDigestValue", out var fd)) return fd.GetString();
-            if (doc.RootElement.TryGetProperty("GetContextWebInformation", out var gcwi) &&
-                gcwi.TryGetProperty("FormDigestValue", out var fd2)) return fd2.GetString();
-            return null;
+            string? digest = doc.RootElement.TryGetProperty("FormDigestValue", out var fd) ? fd.GetString()
+                : doc.RootElement.TryGetProperty("GetContextWebInformation", out var gcwi) &&
+                  gcwi.TryGetProperty("FormDigestValue", out var fd2) ? fd2.GetString() : null;
+            if (digest != null) _digestCache[siteUrl] = (digest, DateTimeOffset.UtcNow);
+            return digest;
         }
         catch { return null; }
     }
@@ -2061,15 +2198,34 @@ public class SharePointService
     {
         try
         {
-            var url = $"{siteUrl.TrimEnd('/')}/_api/web/GetFolderById('{folderUniqueId}')/ListItemAllFields" +
-                $"?$select=Id,Author/EMail,Editor/EMail,Created,Modified,{FolderColorTagFieldName},{FolderColorHexFieldName}&$expand=Author,Editor";
-            using var response = await SendSharePointRequestAsync(token =>
+            // Attempt WITH the color fields, then WITHOUT if that's rejected. The color field names
+            // are unverified (see FolderColorTagFieldName) and a bad name in a $select is a 400 for
+            // the whole request — which would silently disable this entire fast path and put every
+            // folder back on the full EnsureUser+digest+CSOM+read-back cost the 2026-07-10 fix was
+            // added to avoid. The retry guarantees a color problem costs at most one extra GET on
+            // the folders that need correcting, never the optimization itself.
+            string BuildUrl(bool withColor) =>
+                $"{siteUrl.TrimEnd('/')}/_api/web/GetFolderById('{folderUniqueId}')/ListItemAllFields" +
+                "?$select=Id,Author/EMail,Editor/EMail,Created,Modified" +
+                (withColor ? $",{FolderColorTagODataName},{FolderColorHexODataName}" : "") +
+                "&$expand=Author,Editor";
+
+            async Task<HttpResponseMessage> SendAsync(bool withColor) =>
+                await SendSharePointRequestAsync(token =>
+                {
+                    var r = new HttpRequestMessage(HttpMethod.Get, BuildUrl(withColor));
+                    r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                    r.Headers.Accept.ParseAdd("application/json;odata=nometadata");
+                    return r;
+                }, siteUrl);
+
+            var response = await SendAsync(withColor: true);
+            if (!response.IsSuccessStatusCode)
             {
-                var r = new HttpRequestMessage(HttpMethod.Get, url);
-                r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                r.Headers.Accept.ParseAdd("application/json;odata=nometadata");
-                return r;
-            }, siteUrl);
+                response.Dispose();
+                response = await SendAsync(withColor: false);
+            }
+            using var _ = response;
             if (!response.IsSuccessStatusCode) return null;
 
             var body = await response.Content.ReadAsStringAsync();
@@ -2081,14 +2237,27 @@ public class SharePointService
                 a.TryGetProperty("EMail", out var ae) ? ae.GetString() : null;
             string? editorEmail = root.TryGetProperty("Editor", out var e) && e.ValueKind == JsonValueKind.Object &&
                 e.TryGetProperty("EMail", out var ee) ? ee.GetString() : null;
+            // Pinned to InvariantCulture: a non-Gregorian default calendar (e.g. ar-SA) could
+            // otherwise misparse SharePoint's ISO 8601 string and silently read back as null.
             DateTimeOffset? created = root.TryGetProperty("Created", out var c) && c.ValueKind == JsonValueKind.String &&
-                DateTimeOffset.TryParse(c.GetString(), out var cv) ? cv : null;
+                DateTimeOffset.TryParse(c.GetString(), System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.None, out var cv) ? cv : null;
             DateTimeOffset? modified = root.TryGetProperty("Modified", out var m) && m.ValueKind == JsonValueKind.String &&
-                DateTimeOffset.TryParse(m.GetString(), out var mv) ? mv : null;
-            string? colorTag = root.TryGetProperty(FolderColorTagFieldName, out var ct) && ct.ValueKind == JsonValueKind.String
-                ? ct.GetString() : null;
-            string? colorHex = root.TryGetProperty(FolderColorHexFieldName, out var ch) && ch.ValueKind == JsonValueKind.String
-                ? ch.GetString() : null;
+                DateTimeOffset.TryParse(m.GetString(), System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.None, out var mv) ? mv : null;
+            // `_ColorHex` is an INTEGER field, so accept a JSON number as well as a string — an
+            // earlier string-only check read every colored folder back as null.
+            static string? ReadColor(JsonElement obj, string name) =>
+                obj.TryGetProperty(name, out var el)
+                    ? el.ValueKind switch
+                    {
+                        JsonValueKind.String => el.GetString(),
+                        JsonValueKind.Number => el.ToString(),
+                        _ => null,
+                    }
+                    : null;
+            string? colorTag = ReadColor(root, FolderColorTagODataName);
+            string? colorHex = ReadColor(root, FolderColorHexODataName);
 
             return (idEl.GetInt32(), authorEmail, editorEmail, created, modified, colorTag, colorHex);
         }
@@ -2160,8 +2329,7 @@ public class SharePointService
 
     private async Task<string?> PatchTimestampsViaRestAsync(
         string driveId, string itemId, DateTimeOffset? modified, DateTimeOffset? created,
-        string? createdByEmail = null, string? modifiedByEmail = null,
-        string? colorTag = null, string? colorHex = null)
+        string? createdByEmail = null, string? modifiedByEmail = null)
     {
         var ids = await GetSharePointIdsAsync(driveId, itemId);
         if (ids == null) return "SP IDs unavailable — item not found or sharepointIds not propagated";
@@ -2188,68 +2356,85 @@ public class SharePointService
             formValues.Add(new { FieldName = "Editor", FieldValue = $"i:0#.f|membership|{modifiedByEmail}" });
         if (!string.IsNullOrEmpty(createdByEmail))
             formValues.Add(new { FieldName = "Author", FieldValue = $"i:0#.f|membership|{createdByEmail}" });
-        // Only meaningful for folders (see FolderColorTagFieldName) — harmless no-op for a file
-        // since FileMetadata.ColorTag/ColorHex are only ever populated for folders. Unlike the
-        // SPMI/CSOM color write, this rides in the SAME ValidateUpdateListItem call as the other
-        // fields: REST validates/applies each formValue independently, so a wrong/unrecognized
-        // color field name here only shows up as its own per-field error below, never blocking
-        // Modified/Created/Author/Editor.
-        if (!string.IsNullOrEmpty(colorTag))
-            formValues.Add(new { FieldName = FolderColorTagFieldName, FieldValue = colorTag });
-        if (!string.IsNullOrEmpty(colorHex))
-            formValues.Add(new { FieldName = FolderColorHexFieldName, FieldValue = colorHex });
-
+        // Folder color is deliberately NOT sent here. The color fields are ReadOnlyField="TRUE", and
+        // ValidateUpdateListItem's commit is ALL-OR-NOTHING — the spec states that if any field
+        // raises an exception the item is not committed at all, and an unknown field name faults the
+        // whole call. Including color would therefore risk discarding the dates and authorship too.
+        // Color is applied separately, and earlier, via StampFolderColorAsync.
         if (formValues.Count == 0) return null;
 
-        try
+        return await PostValidateUpdateAsync(formValues);
+
+        // Routed through SendSharePointRequestAsync like every other REST write in this file. It
+        // previously called _httpClient.SendAsync directly — the only write here that did — which
+        // meant this, the hottest write in the app (once per file, and once per version per file via
+        // ApplyFileMetadataAsync), had NO 429/503 retry, NO 401 force-refresh, no cancellation, and
+        // leaked its HttpResponseMessage. A throttle window or a token expiring mid-run therefore
+        // silently left files with the migrating account as Author/Editor and today's dates.
+        async Task<string?> PostValidateUpdateAsync(List<object> values)
         {
-            var token = await _authService.GetSharePointTokenAsync(siteUrl);
-            var url   = $"{siteUrl}/_api/web/lists('{listId}')/items({listItemId})/ValidateUpdateListItem()";
-            using var req = new HttpRequestMessage(HttpMethod.Post, url)
-            {
-                Content = new System.Net.Http.StringContent(
-                    JsonSerializer.Serialize(new { formValues, bNewDocumentUpdate = true }),
-                    System.Text.Encoding.UTF8, "application/json")
-            };
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-            req.Headers.Accept.ParseAdd("application/json;odata=nometadata");
-            var response = await _httpClient.SendAsync(req);
-            var body = await response.Content.ReadAsStringAsync();
-
-            if (!response.IsSuccessStatusCode)
-            {
-                var preview = body.Length > 200 ? body[..200] : body;
-                return $"ValidateUpdateListItem HTTP {(int)response.StatusCode}: {preview}";
-            }
-
             try
             {
-                using var doc = JsonDocument.Parse(body);
-                if (doc.RootElement.TryGetProperty("value", out var arr))
+                var url = $"{siteUrl.TrimEnd('/')}/_api/web/lists('{listId}')/items({listItemId})/ValidateUpdateListItem()";
+                var payload = JsonSerializer.Serialize(new { formValues = values, bNewDocumentUpdate = true });
+                using var response = await SendSharePointRequestAsync(token =>
                 {
-                    var fieldErrors = new List<string>();
-                    foreach (var field in arr.EnumerateArray())
+                    var r = new HttpRequestMessage(HttpMethod.Post, url)
                     {
-                        bool hasEx = field.TryGetProperty("HasException", out var he) && he.GetBoolean();
-                        int  ec    = field.TryGetProperty("ErrorCode",    out var ecEl) ? ecEl.GetInt32() : 0;
-                        if (hasEx || ec != 0)
-                        {
-                            var fn = field.TryGetProperty("FieldName",    out var fnEl) ? fnEl.GetString() ?? "" : "";
-                            var em = field.TryGetProperty("ErrorMessage", out var emEl) ? emEl.GetString() ?? "" : "";
-                            fieldErrors.Add($"{fn}: {em} (code {ec})");
-                        }
-                    }
-                    if (fieldErrors.Count > 0)
-                        return $"Field errors: {string.Join("; ", fieldErrors)}";
-                }
-            }
-            catch { }
+                        Content = new System.Net.Http.StringContent(
+                            payload, System.Text.Encoding.UTF8, "application/json")
+                    };
+                    r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                    r.Headers.Accept.ParseAdd("application/json;odata=nometadata");
+                    return r;
+                }, siteUrl);
+                var body = await response.Content.ReadAsStringAsync();
 
-            return null;
-        }
-        catch (Exception ex)
-        {
-            return $"ValidateUpdateListItem exception: {ex.Message}";
+                if (!response.IsSuccessStatusCode)
+                {
+                    var preview = body.Length > 200 ? body[..200] : body;
+                    return $"ValidateUpdateListItem HTTP {(int)response.StatusCode}: {preview}";
+                }
+
+                // A parse failure here used to be swallowed and reported as SUCCESS, i.e. "metadata
+                // applied" — the same class of silent-loss bug this file has hit repeatedly. Treat an
+                // unreadable response as an error instead; the HTTP status alone is not proof, since
+                // ValidateUpdateListItem reports per-field failures inside a 200.
+                try
+                {
+                    using var doc = JsonDocument.Parse(body);
+                    if (doc.RootElement.TryGetProperty("value", out var arr))
+                    {
+                        var fieldErrors = new List<string>();
+                        foreach (var field in arr.EnumerateArray())
+                        {
+                            bool hasEx = field.TryGetProperty("HasException", out var he) &&
+                                         he.ValueKind == JsonValueKind.True;
+                            int  ec    = field.TryGetProperty("ErrorCode", out var ecEl) &&
+                                         ecEl.ValueKind == JsonValueKind.Number ? ecEl.GetInt32() : 0;
+                            if (hasEx || ec != 0)
+                            {
+                                var fn = field.TryGetProperty("FieldName",    out var fnEl) ? fnEl.GetString() ?? "" : "";
+                                var em = field.TryGetProperty("ErrorMessage", out var emEl) ? emEl.GetString() ?? "" : "";
+                                fieldErrors.Add($"{fn}: {em} (code {ec})");
+                            }
+                        }
+                        if (fieldErrors.Count > 0)
+                            return $"Field errors: {string.Join("; ", fieldErrors)}";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    return $"Could not parse ValidateUpdateListItem response ({ex.Message}) — " +
+                           $"metadata may not have been applied: {body[..Math.Min(body.Length, 200)]}";
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return $"ValidateUpdateListItem exception: {ex.Message}";
+            }
         }
     }
 
@@ -2258,15 +2443,22 @@ public class SharePointService
     {
         return await PatchTimestampsViaRestAsync(driveId, itemId,
             metadata.ModifiedDateTime, metadata.CreatedDateTime,
-            metadata.CreatedByEmail, metadata.ModifiedByEmail,
-            metadata.ColorTag, metadata.ColorHex);
+            metadata.CreatedByEmail, metadata.ModifiedByEmail);
     }
 
     public async Task<string?> GetCurrentVersionIdAsync(string driveId, string itemId)
     {
         try
         {
-            var page = await Graph.Drives[driveId].Items[itemId].Versions.GetAsync();
+            // Called once per replayed version during version-history copy, and each iteration has
+            // added ~2 versions (upload + phantom) to this same item — an unbounded GetAsync() here
+            // re-fetched the WHOLE, growing version collection just to read one Id, an O(N²)-bytes
+            // cost across the replay. $top=1 + $select=id reduces it to the single field needed.
+            var page = await Graph.Drives[driveId].Items[itemId].Versions.GetAsync(cfg =>
+            {
+                cfg.QueryParameters.Top    = 1;
+                cfg.QueryParameters.Select = ["id"];
+            });
             return page?.Value?.FirstOrDefault()?.Id;
         }
         catch { return null; }
@@ -2762,12 +2954,24 @@ public class SharePointService
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    // 404 = folder doesn't exist yet (fresh target) — genuinely empty. Anything else is
-                    // logged but still returns what we have: the caller merges this with the Graph
-                    // listing, so a degraded REST view falls back to Graph-only behavior, not failure.
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[RestFolderList] HTTP {(int)response.StatusCode} for {folderServerRelativeUrl}");
-                    return result;
+                    if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+                    {
+                        // Folder doesn't exist yet (fresh target) — genuinely empty.
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[RestFolderList] 404 (folder not found) for {folderServerRelativeUrl}");
+                        return result;
+                    }
+                    // Any OTHER status used to be treated the same as 404 — "return what we have" —
+                    // which silently truncated the snapshot on page 2+ of a large folder (12,000+
+                    // files) under throttling. The caller (MigrationJobService's overwrite pre-flight)
+                    // merges this result assuming it's complete: a truncated snapshot meant existing
+                    // files past the failed page were never queued for deletion, and SPMI then
+                    // rejected the whole re-import with "already exists" — precisely the regression
+                    // this method exists to prevent. Throw instead so the failure is visible.
+                    var errBody = await response.Content.ReadAsStringAsync();
+                    throw new HttpRequestException(
+                        $"Listing folder files failed: HTTP {(int)response.StatusCode} for {folderServerRelativeUrl} — " +
+                        $"{errBody[..Math.Min(errBody.Length, 300)]}");
                 }
 
                 var body = await response.Content.ReadAsStringAsync();
@@ -2780,7 +2984,8 @@ public class SharePointService
                         DateTimeOffset? modified = null;
                         if (item.TryGetProperty("TimeLastModified", out var tm) &&
                             tm.ValueKind == JsonValueKind.String &&
-                            DateTimeOffset.TryParse(tm.GetString(), out var dt))
+                            DateTimeOffset.TryParse(tm.GetString(), System.Globalization.CultureInfo.InvariantCulture,
+                                System.Globalization.DateTimeStyles.None, out var dt))
                             modified = dt;
                         result[n.GetString()!] = modified;
                     }
@@ -3345,6 +3550,15 @@ public class SharePointService
     // otherwise serves those dead IDs forever.
     public void ResetFolderSegmentCache() => _folderSegmentTasks.Clear();
 
+    // Column definitions are cached per listId for the app's session lifetime with no reset
+    // anywhere except one narrow list-copy path's explicit skipCache:true. If the user adds or
+    // retypes a target column between two runs without restarting the app, the general file-copy
+    // custom-column path (ApplyFileCustomFieldsAsync's internal GetLibraryColumnsAsync call) kept
+    // resolving against the stale definition — e.g. a Lookup column whose LookupListId changed
+    // would resolve against the old list. Call at the start of every run, alongside
+    // ResetFolderSegmentCache().
+    public void ResetColumnCache() => _columnCache.Clear();
+
     // True for exceptions that represent a dropped/failed connection rather than a real Graph response
     // (including a proper throttle response, which Kiota's own retry handler already resolves before
     // it would ever reach this code). VERIFIED (114k-file run, 2026-07-01): under sustained throttling
@@ -3813,9 +4027,13 @@ public class SharePointService
             {
                 result = id.GetInt32();
             }
+            // Cache only on a SUCCESSFUL request — whether it found a match (result != null) or
+            // genuinely found none (result == null, a trustworthy "no such value" since the query
+            // itself succeeded). A failed request (429/500/etc., post-retry) is NOT cached: it could
+            // be transient rather than "this value doesn't exist", and caching it would permanently
+            // blank that lookup value for every remaining file in the session that references it.
+            _lookupValueCache[cacheKey] = result;
         }
-
-        _lookupValueCache[cacheKey] = result;
         return result;
     }
 
@@ -3833,7 +4051,7 @@ public class SharePointService
 
         // Resolve target SharePoint IDs first so we can look up target column definitions
         // (needed to find the target lookup list GUID for Lookup/LookupMulti fields).
-        var ids = await GetSharePointIdsAsync(driveId, itemId)
+        var ids = await GetSharePointIdsAsync(driveId, itemId, ct)
             ?? throw new Exception($"Could not resolve SharePoint IDs for {driveId}/{itemId}");
 
         // Fetch target column defs (cached) to resolve lookup list GUIDs.
@@ -3878,6 +4096,14 @@ public class SharePointService
                     if (targetId.HasValue) resolvedIds.Add(targetId.Value);
                 }
 
+                // Surface both total and PARTIAL resolution failures — previously silent: a fully
+                // unresolved field skipped with no entry in lookupErrors, and a partially-resolved
+                // multi-value lookup (e.g. 3 of 4 entries) submitted only the resolved ones with no
+                // warning at all that one was dropped.
+                if (resolvedIds.Count < lookup.Entries.Length)
+                    lookupErrors.Add(resolvedIds.Count == 0
+                        ? $"{targetName} (0 of {lookup.Entries.Length} values resolved)"
+                        : $"{targetName} ({lookup.Entries.Length - resolvedIds.Count} of {lookup.Entries.Length} values unresolved)");
                 if (resolvedIds.Count == 0) continue; // nothing resolved — skip field
                 // Single: "3", Multi: "3;#;#5;#" (SP lookup wire format with ID only)
                 var formatted = resolvedIds.Count == 1
@@ -3909,9 +4135,9 @@ public class SharePointService
             r.Headers.Accept.ParseAdd("application/json;odata=nometadata");
             r.Content = new StringContent(payload, System.Text.Encoding.UTF8, "application/json");
             return r;
-        }, ids.siteUrl);
+        }, ids.siteUrl, cancellationToken: ct);
 
-        var body = await response.Content.ReadAsStringAsync();
+        var body = await response.Content.ReadAsStringAsync(ct);
         if (!response.IsSuccessStatusCode)
             return $"ApplyCustomFields HTTP {(int)response.StatusCode}";
 
@@ -4149,7 +4375,12 @@ public class SharePointService
         string siteUrl, string pageServerRelativeUrl)
     {
         var fileName    = System.IO.Path.GetFileName(pageServerRelativeUrl.Replace('\\', '/'));
-        var escapedName = fileName.Replace("'", "''");
+        // The OData quote-doubling alone isn't enough — the result still gets interpolated
+        // directly into the query string. A page named "Q3 #Review.aspx" truncated the request
+        // at the '#' (URL fragment), and '&'/'+' broke it similarly, misdiagnosing a real page as
+        // "not found in source Site Pages library". Uri.EscapeDataString is the fix every other
+        // REST filter/path builder in this file already applies (see ResolveLookupValueAsync).
+        var escapedName = Uri.EscapeDataString(fileName.Replace("'", "''"));
 
         // Step 1: find the SitePages integer ID by filename
         int pageId = 0;
@@ -4694,7 +4925,8 @@ public class SharePointService
                                     : string.Empty;
                     DateTimeOffset? modified = el.TryGetProperty("Modified", out var mp) &&
                                                mp.ValueKind == JsonValueKind.String &&
-                                               DateTimeOffset.TryParse(mp.GetString(), out var m)
+                                               DateTimeOffset.TryParse(mp.GetString(), System.Globalization.CultureInfo.InvariantCulture,
+                                                   System.Globalization.DateTimeStyles.None, out var m)
                                                    ? m : null;
                     if (!string.IsNullOrEmpty(id))
                         result.Add((id, title, modified));
@@ -4730,20 +4962,20 @@ public class SharePointService
             r.Headers.Accept.ParseAdd("application/json;odata=nometadata");
             r.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
             return r;
-        }, siteUrl))
+        }, siteUrl, cancellationToken: ct))
         {
             if (!resp.IsSuccessStatusCode)
             {
-                var errBody = await resp.Content.ReadAsStringAsync();
+                var errBody = await resp.Content.ReadAsStringAsync(ct);
                 throw new HttpRequestException($"Create item failed: {(int)resp.StatusCode} {resp.ReasonPhrase} — {errBody}");
             }
-            var respBody = await resp.Content.ReadAsStringAsync();
+            var respBody = await resp.Content.ReadAsStringAsync(ct);
             using var doc = JsonDocument.Parse(respBody);
             newItemId = doc.RootElement.TryGetProperty("Id", out var ip) ? ip.GetRawText() : null;
         }
 
         if (newItemId == null) return (null, null);
-        var fieldError = await ValidateUpdateItemFieldsAsync(siteUrl, listId, newItemId, complexFields, createdDate, modifiedDate);
+        var fieldError = await ValidateUpdateItemFieldsAsync(siteUrl, listId, newItemId, complexFields, createdDate, modifiedDate, ct);
         return (newItemId, fieldError);
     }
 
@@ -4773,7 +5005,8 @@ public class SharePointService
     private async Task<string?> ValidateUpdateItemFieldsAsync(
         string siteUrl, string listId, string itemId,
         List<(string Name, object Value)> complexFields,
-        string? createdDate, string? modifiedDate)
+        string? createdDate, string? modifiedDate,
+        CancellationToken ct = default)
     {
         var formValues = complexFields
             .Select(f => (object)new { FieldName = f.Name, FieldValue = FormatFieldValueForValidate(f.Value) })
@@ -4792,9 +5025,9 @@ public class SharePointService
             r.Headers.Accept.ParseAdd("application/json;odata=nometadata");
             r.Content = new StringContent(payload, System.Text.Encoding.UTF8, "application/json");
             return r;
-        }, siteUrl);
+        }, siteUrl, cancellationToken: ct);
 
-        var body = await resp.Content.ReadAsStringAsync();
+        var body = await resp.Content.ReadAsStringAsync(ct);
         if (!resp.IsSuccessStatusCode)
             return $"Field write failed ({(int)resp.StatusCode}): {body[..Math.Min(200, body.Length)]}";
 
@@ -4839,15 +5072,15 @@ public class SharePointService
             r.Headers.Add("If-Match", "*");
             r.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
             return r;
-        }, siteUrl);
+        }, siteUrl, cancellationToken: ct);
 
         if (!resp.IsSuccessStatusCode)
         {
-            var errBody = await resp.Content.ReadAsStringAsync();
+            var errBody = await resp.Content.ReadAsStringAsync(ct);
             throw new HttpRequestException($"Update item failed: {(int)resp.StatusCode} {resp.ReasonPhrase} — {errBody}");
         }
 
-        return await ValidateUpdateItemFieldsAsync(siteUrl, listId, itemId, complexFields, createdDate, modifiedDate);
+        return await ValidateUpdateItemFieldsAsync(siteUrl, listId, itemId, complexFields, createdDate, modifiedDate, ct);
     }
 
     private static object? ExtractJsonValue(JsonElement el) => el.ValueKind switch
@@ -4873,28 +5106,37 @@ public class SharePointService
         while (next != null)
         {
             ct.ThrowIfCancellationRequested();
-            try
+            using var resp = await SendSharePointRequestAsync(token =>
             {
-                using var resp = await SendSharePointRequestAsync(token =>
-                {
-                    var r = new HttpRequestMessage(HttpMethod.Get, next);
-                    r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                    r.Headers.Accept.ParseAdd("application/json;odata=nometadata");
-                    return r;
-                }, siteUrl, cancellationToken: ct);
-                if (!resp.IsSuccessStatusCode) break;
-                var body = await resp.Content.ReadAsStringAsync(ct);
-                using var doc = JsonDocument.Parse(body);
-                if (doc.RootElement.TryGetProperty("value", out var vals))
-                    foreach (var el in vals.EnumerateArray())
-                    {
-                        var id      = el.TryGetProperty("Id",                    out var ip) ? ip.GetInt32().ToString() : null;
-                        var unique  = el.TryGetProperty("HasUniqueRoleAssignments", out var up) && up.GetBoolean();
-                        if (id != null) result[PermissionFlagKey(listId, id)] = unique;
-                    }
-                next = GetNextLink(doc.RootElement);
+                var r = new HttpRequestMessage(HttpMethod.Get, next);
+                r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                r.Headers.Accept.ParseAdd("application/json;odata=nometadata");
+                return r;
+            }, siteUrl, cancellationToken: ct);
+            if (!resp.IsSuccessStatusCode)
+            {
+                // Never truncate silently: a failed page used to `break` and return the PARTIAL
+                // dictionary built so far. A missing key reads identically to "no unique
+                // permissions" at every call site (`if (!permissionFlags.TryGetValue(...) || !hu)
+                // return;`), so every item past the failed page silently copied with inherited
+                // permissions and no row was ever logged. All four call sites already wrap this in
+                // a try/catch ("that library's permissions are skipped"), so throwing here just
+                // routes a genuine failure to the existing, visible skip path instead of an
+                // indistinguishable partial success.
+                var err = await resp.Content.ReadAsStringAsync(ct);
+                throw new HttpRequestException(
+                    $"Reading permission flags failed: HTTP {(int)resp.StatusCode} — {err[..Math.Min(err.Length, 300)]}");
             }
-            catch { break; }
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("value", out var vals))
+                foreach (var el in vals.EnumerateArray())
+                {
+                    var id      = el.TryGetProperty("Id",                    out var ip) ? ip.GetInt32().ToString() : null;
+                    var unique  = el.TryGetProperty("HasUniqueRoleAssignments", out var up) && up.GetBoolean();
+                    if (id != null) result[PermissionFlagKey(listId, id)] = unique;
+                }
+            next = GetNextLink(doc.RootElement);
         }
         return result;
     }
@@ -4929,7 +5171,12 @@ public class SharePointService
         catch { return false; }
     }
 
-    public async Task<List<RoleAssignmentInfo>> GetRoleAssignmentsAsync(
+    // Returns null on a genuine READ failure (distinct from a real empty list) so the caller can
+    // tell "this item truly has no unique role assignments" from "we couldn't find out" — the two
+    // used to look identical (both `[]`), so a transient failure reading the SOURCE permissions
+    // silently reported "0 applied, no error" instead of skipping the item to retry later, and the
+    // target was left with only inherited permissions with nothing in the log to explain why.
+    public async Task<List<RoleAssignmentInfo>?> GetRoleAssignmentsAsync(
         string siteUrl, string apiPath, CancellationToken ct = default)
     {
         var url = $"{siteUrl.TrimEnd('/')}/_api/{apiPath}/roleassignments" +
@@ -4943,7 +5190,7 @@ public class SharePointService
                 r.Headers.Accept.ParseAdd("application/json;odata=nometadata");
                 return r;
             }, siteUrl, cancellationToken: ct);
-            if (!resp.IsSuccessStatusCode) return [];
+            if (!resp.IsSuccessStatusCode) return null;
             var body = await resp.Content.ReadAsStringAsync(ct);
             using var doc = JsonDocument.Parse(body);
             if (!doc.RootElement.TryGetProperty("value", out var vals)) return [];
@@ -4965,7 +5212,7 @@ public class SharePointService
             }
             return result;
         }
-        catch { return []; }
+        catch { return null; }
     }
 
     public async Task BreakPermissionInheritanceAsync(
@@ -5009,6 +5256,15 @@ public class SharePointService
     public async Task<int?> EnsureUserAsync(
         string siteUrl, string loginName, CancellationToken ct = default)
     {
+        // Cache successes only — the set of distinct emails needing resolution across a library is
+        // typically tens, so this collapses thousands of redundant POSTs to one per account. A
+        // failure is NOT cached: it could be a transient throttle/error rather than "this account
+        // doesn't exist on this site", and caching it would permanently misreport every later folder
+        // sharing that author/editor as unresolvable (the same failure class as the lookup-value
+        // cache poisoning bug this app has hit before).
+        var cacheKey = $"{siteUrl}|{loginName}";
+        if (_ensureUserCache.TryGetValue(cacheKey, out var cachedId)) return cachedId;
+
         var url  = $"{siteUrl.TrimEnd('/')}/_api/web/ensureuser";
         var body = JsonSerializer.Serialize(new { logonName = loginName });
         try
@@ -5024,7 +5280,9 @@ public class SharePointService
             if (!resp.IsSuccessStatusCode) return null;
             var respBody = await resp.Content.ReadAsStringAsync(ct);
             using var doc = JsonDocument.Parse(respBody);
-            return doc.RootElement.TryGetProperty("Id", out var ip) ? ip.GetInt32() : null;
+            int? id = doc.RootElement.TryGetProperty("Id", out var ip) ? ip.GetInt32() : null;
+            if (id != null) _ensureUserCache[cacheKey] = id;
+            return id;
         }
         catch { return null; }
     }

@@ -44,6 +44,9 @@ public class PermissionCopyService(SharePointService spService)
                 "Target role definitions unavailable — permissions not copied (inheritance left unchanged); re-run to retry");
 
         var assignments = await spService.GetRoleAssignmentsAsync(sourceSiteUrl, sourceApiPath, ct);
+        if (assignments == null)
+            return new PermissionCopyResult(itemDisplayName, 0, [],
+                "Could not read source permissions — permissions not copied (inheritance left unchanged); re-run to retry");
 
         // "Limited Access" bindings are hierarchy plumbing SharePoint maintains itself and rejects
         // when granted directly — copying them only produced failed-role noise, and an object whose

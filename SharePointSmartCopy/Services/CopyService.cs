@@ -9,6 +9,74 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
     // Fired when adaptive throttling changes the effective parallelism during a copy run.
     public event Action<int>? ParallelismChanged;
 
+    // Per-target-folder snapshot of existing files (name -> id/modified), used by the Enhanced REST
+    // Skip/IfNewer decision (see CopySingleFileAsync) instead of one GetFileInfoAsync Graph call PER
+    // FILE. On an all-skip Copy-If-Newer re-run of 100k files that was 100k round trips for a
+    // decision one per-folder listing already answers for every file in it — ~5,000 folders means
+    // ~20x fewer calls. Reset per run (see ExecuteCoreAsync) since target state can change between
+    // runs; the Lazy dedupes concurrent first-access races to the same folder into one Graph call,
+    // matching the pattern _folderSegmentTasks already uses.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string,
+        Lazy<Task<Dictionary<string, (string ItemId, DateTimeOffset? Modified)>>>> _folderSnapshotCache = new();
+
+    // Files at or above this size are spilled to a temp file rather than buffered fully in memory.
+    // Enhanced REST previously buffered EVERY file into a MemoryStream with no size gate at all —
+    // unbounded per file, multiplied by maxParallel concurrent copies (the same OOM incident class
+    // a large-file gate + memory budget were built for on the Migration API side, just never
+    // ported to this engine). MemoryStream also caps at int.MaxValue, so a file over ~2 GB threw
+    // "Stream was too long" here — even though MigrationJobService's own >2 GB error message tells
+    // the user to retry with Enhanced REST. That advice did not actually work until this fix. An
+    // unknown size is treated as large, the same defensive default the Migration API gate uses.
+    private const long EnhancedRestLargeFileThresholdBytes = 100L * 1024 * 1024; // 100 MB
+
+    // Bounds how many large files are buffered (spilled to disk) at once, independent of
+    // maxParallel — mirrors MigrationJobService's largeFileGate/MaxConcurrentLargeFiles. Small
+    // files never touch this gate. A plain field (not scoped per-run) is fine: the count always
+    // returns to its max once every holder releases in its `finally`, so nothing needs resetting
+    // between runs.
+    private readonly SemaphoreSlim _largeFileGate = new(2);
+
+    private static bool IsLargeForBuffering(long? knownSize) =>
+        !knownSize.HasValue || knownSize.Value >= EnhancedRestLargeFileThresholdBytes;
+
+    private static Stream CreateTransferBuffer(bool spillToDisk) =>
+        spillToDisk
+            // DeleteOnClose: the temp file is removed as soon as the caller's `using` disposes the
+            // stream, including on an exception — no separate cleanup path needed.
+            ? new FileStream(Path.GetTempFileName(), FileMode.Create, FileAccess.ReadWrite, FileShare.None,
+                bufferSize: 81920, FileOptions.DeleteOnClose)
+            : new MemoryStream();
+
+    private Task<Dictionary<string, (string ItemId, DateTimeOffset? Modified)>> GetOrBuildFolderSnapshotAsync(
+        string driveId, string parentItemId)
+    {
+        var cacheKey = $"{driveId}|{parentItemId}";
+        var d = driveId; var p = parentItemId;
+        var lazy = _folderSnapshotCache.GetOrAdd(cacheKey,
+            _ => new Lazy<Task<Dictionary<string, (string ItemId, DateTimeOffset? Modified)>>>(
+                () => spService.FetchFolderItemsAsync(d, p),
+                System.Threading.LazyThreadSafetyMode.ExecutionAndPublication));
+        return AwaitOrEvict(cacheKey, lazy);
+    }
+
+    private async Task<Dictionary<string, (string ItemId, DateTimeOffset? Modified)>> AwaitOrEvict(
+        string cacheKey, Lazy<Task<Dictionary<string, (string ItemId, DateTimeOffset? Modified)>>> lazy)
+    {
+        try
+        {
+            return await lazy.Value;
+        }
+        catch
+        {
+            // Never cache a faulted resolution — a single transient failure would otherwise make
+            // every remaining file in this folder, for the rest of the run, fall back as if the
+            // folder were empty (Skip mode would then re-upload everything; IfNewer would too).
+            _folderSnapshotCache.TryRemove(new KeyValuePair<string,
+                Lazy<Task<Dictionary<string, (string ItemId, DateTimeOffset? Modified)>>>>(cacheKey, lazy));
+            throw;
+        }
+    }
+
     public async Task ExecuteAsync(
         IList<CopyJob> jobs,
         ObservableCollection<CopyResult> results,
@@ -109,8 +177,26 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         // Target folder item IDs cached in a previous run go stale if folders were deleted or
         // renamed between runs — and a faulted entry must never poison a fresh run.
         spService.ResetFolderSegmentCache();
+        spService.ResetColumnCache();
+        _folderSnapshotCache.Clear();
 
         var allTasks  = new List<(CopyJob job, CopyResult result)>();
+
+        // Empty folders (SourceFileEntry.IsEmptyFolder) are created directly in the scan loop below
+        // and never become file jobs in allTasks — so the dirty-path set built from allTasks (further
+        // down) never included them, and the separate folder-metadata pass then filtered them out as
+        // "not touched this run", leaving them permanently stamped with today's date and the
+        // migrating account regardless of preserved source metadata. Newly-created ones are recorded
+        // here so their paths can be folded into that same dirty set.
+        var newlyCreatedEmptyFolderPaths = new List<string>();
+
+        // Pre-seeded rows (e.g. from a "select individual files" UI flow that creates placeholder
+        // rows before the copy starts) are looked up by source path once per top-level job below.
+        // Built once, O(n), instead of FindResult's old per-job linear scan of the whole (and
+        // growing) results collection — O(n²) on a selection of many individual files.
+        var resultsBySourcePath = new Dictionary<string, CopyResult>(StringComparer.Ordinal);
+        foreach (var r in results)
+            resultsBySourcePath.TryAdd(r.SourcePath, r);
 
         // Buffer new result rows and flush them to the bound collection in chunks. Adding tens of
         // thousands of rows one at a time via a *synchronous* Dispatcher.Invoke saturates the UI
@@ -165,7 +251,19 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
             {
                 if (!job.IsFolder)
                 {
-                    var result = FindResult(results, job.SourceDisplayPath) ?? CreateResult(job);
+                    // Every current caller pre-seeds `results` with a placeholder row for each
+                    // directly-selected file before calling ExecuteAsync, so the TryGetValue branch
+                    // is what actually runs today. But if a future caller doesn't, CreateResult(job)
+                    // was previously added only to allTasks — never to pendingResults/results — so
+                    // that file would copy successfully yet never appear in the grid or the saved
+                    // report. Flushing it here closes that gap defensively.
+                    bool hadExisting = resultsBySourcePath.TryGetValue(job.SourceDisplayPath, out var existingResult);
+                    var result = hadExisting ? existingResult! : CreateResult(job);
+                    if (!hadExisting)
+                    {
+                        pendingResults.Add(result);
+                        if (pendingResults.Count >= 200) await FlushPendingResultsAsync();
+                    }
                     allTasks.Add((job, result));
                 }
                 else if (await spService.IsRootFolderSpecialContainerAsync(job.SourceDriveId, job.SourceItemId))
@@ -317,6 +415,7 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                                     await spService.GetOrCreateFolderPathAsync(
                                         job.TargetDriveId, job.TargetParentItemId, emptyFolderTarget);
                                     folderResult.Status = CopyStatus.Success;
+                                    newlyCreatedEmptyFolderPaths.Add(emptyFolderTarget);
                                 }
                             }
                             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -434,7 +533,7 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                             job.SourceName, ct);
 
                         if (perm.HasActivity)
-                            AddPermissionRow(results, perm, result.TargetPath);
+                            AddPermissionRow(results, perm, result);
                     }
                     catch (OperationCanceledException) { throw; }
                     catch { /* non-fatal */ }
@@ -443,12 +542,21 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         }
         else
         {
-            // Mode B: enhanced REST, parallel per-file
-            var parallelTasks = allTasks.Select(t =>
-                CopySingleFileAsync(t.job, t.result, overwriteMode, copyVersions, maxVersions, controller, cancellationToken,
+            // Mode B: enhanced REST, parallel per-file. Parallel.ForEachAsync rather than
+            // allTasks.Select(...) + Task.WhenAll: the Select form launches EVERY task immediately —
+            // on a 250k-file run that's 250k async state machines plus a 250k-node SemaphoreSlim wait
+            // queue plus a 250k-element array for WhenAll, well over 100 MB of pure scheduling
+            // overhead before any file transfers, even though CopySingleFileAsync's own
+            // AdaptiveParallelismController gate still limits how many run at once. ForEachAsync
+            // only materializes MaxDegreeOfParallelism bodies at a time; the controller still governs
+            // live (adaptive, shrink-on-throttle) width exactly as before — per-item exceptions are
+            // already fully contained inside CopySingleFileAsync, so ForEachAsync's fail-fast
+            // semantics don't change behavior.
+            await Parallel.ForEachAsync(allTasks,
+                new ParallelOptions { MaxDegreeOfParallelism = maxParallel, CancellationToken = cancellationToken },
+                async (t, ct) => await CopySingleFileAsync(t.job, t.result, overwriteMode, copyVersions, maxVersions, controller, ct,
                     copyCustomColumns, columnMappings, bulkFieldCache, copyPages, remapPageWebPartUrls, preserveMetadata,
                     copyPermissions, permissionService, permissionFlags, permissionResults: results));
-            await Task.WhenAll(parallelTasks);
         }
 
         // SPMI already stamps folder timestamps via the manifest's TimeLastModified / TimeCreated /
@@ -463,7 +571,7 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
             if (copyPermissions && permissionService != null && spmiFolderJobs.Count > 0)
                 _ = ApplyAllFolderMetadataAsync(spmiFolderJobs, maxParallel, onMetadataDone, cancellationToken,
                     copyPermissions, permissionService, results, onFolderProgress,
-                    dirtyFolderPaths: null, applyMetadata: false);
+                    dirtyFolderPaths: null, applyMetadata: false, activityLog: activityLog);
             else
                 onMetadataDone?.Report(true);
             return;
@@ -472,15 +580,19 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         // For REST mode: only update folders that received at least one successful copy.
         // Build an ancestor-inclusive set from successful file job paths so we skip
         // every clean branch (e.g. unchanged folders when running "If Newer").
+        static IEnumerable<string> AncestorInclusivePaths(string path)
+        {
+            var parts = path.Split('/');
+            return Enumerable.Range(1, parts.Length).Select(i => string.Join("/", parts.Take(i)));
+        }
         var dirtyFolderPaths = allTasks
             .Where(t => t.result.Status == CopyStatus.Success
                      && !string.IsNullOrEmpty(t.job.TargetSubFolderPath))
-            .SelectMany(t =>
-            {
-                var parts = t.job.TargetSubFolderPath!.Split('/');
-                return Enumerable.Range(1, parts.Length)
-                                 .Select(i => string.Join("/", parts.Take(i)));
-            })
+            .SelectMany(t => AncestorInclusivePaths(t.job.TargetSubFolderPath!))
+            // Newly-created empty folders never appear in allTasks (see
+            // newlyCreatedEmptyFolderPaths' declaration) — folded in here so they aren't filtered
+            // out of the folder-metadata pass as "not touched this run".
+            .Concat(newlyCreatedEmptyFolderPaths.Where(p => !string.IsNullOrEmpty(p)).SelectMany(AncestorInclusivePaths))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         var folderJobs = jobs.Where(j => j.IsFolder).ToList();
@@ -491,11 +603,19 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         // permissions even when skipped as up to date). With permissions on, walk ALL folders
         // (dirty tracking only knows about file copies, not permission changes).
         bool wantsFolderPermissions = copyPermissions && permissionService != null;
-        if (folderJobs.Count > 0 && ((preserveMetadata && anyFileCopied) || wantsFolderPermissions))
+        // reapplyFolderMetadata previously did nothing in this (Enhanced REST) branch — it was
+        // consulted only on the Migration API path (see the call into migrationJobService above).
+        // Its own tooltip promises "repairs folder dates/authors/color for every folder in the
+        // selection on each run — needed to fix folder metadata on an already-copied target". With
+        // it on, run the pass regardless of anyFileCopied and walk the WHOLE tree (dirtyFolderPaths
+        // null), matching what SPMI already does; with it off, keep the existing
+        // only-touch-what-changed behavior.
+        bool wantsMetadataPass = preserveMetadata && (anyFileCopied || reapplyFolderMetadata);
+        if (folderJobs.Count > 0 && (wantsMetadataPass || wantsFolderPermissions))
             _ = ApplyAllFolderMetadataAsync(folderJobs, maxParallel, onMetadataDone, cancellationToken,
                 copyPermissions, permissionService, results, onFolderProgress,
-                dirtyFolderPaths: (wantsFolderPermissions || dirtyFolderPaths.Count == 0) ? null : dirtyFolderPaths,
-                applyMetadata: preserveMetadata && anyFileCopied);
+                dirtyFolderPaths: (wantsFolderPermissions || reapplyFolderMetadata || dirtyFolderPaths.Count == 0) ? null : dirtyFolderPaths,
+                applyMetadata: wantsMetadataPass, activityLog: activityLog);
         else
             onMetadataDone?.Report(true);
         } // end ExecuteCoreAsync
@@ -509,20 +629,39 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         ObservableCollection<CopyResult>? permissionResults = null,
         IProgress<(int done, int total)>? folderProgress = null,
         HashSet<string>? dirtyFolderPaths = null,
-        bool applyMetadata = true)
+        bool applyMetadata = true,
+        IProgress<string>? activityLog = null)
     {
         bool completed = true;
+        // This pass was the one phase in the app with NO throttle protection at all: launched
+        // fire-and-forget (`_ =`) after ExecuteCoreAsync already returned and its own Throttled
+        // subscription was torn down, so its inner Parallel.ForEachAsync ran at raw maxParallel with
+        // no adaptive gate — full width straight into a tenant the copy phase had just finished
+        // depleting. Same soft-start + throttle-window-inheriting gate every other analysis phase
+        // uses (see CreateThrottleAwareGate).
+        using var gate = spService.CreateThrottleAwareGate(maxParallel, Math.Min(Math.Max(1, maxParallel), 2));
+        void onThrottle(TimeSpan delay, int _, int __, string? ___) => gate.StepDown(delay);
+        spService.Throttled += onThrottle;
         try
         {
             int[] done  = { 0 };
             int[] total = { 0 };
             foreach (var job in folderJobs)
-                await ApplyFolderMetadataRecursiveAsync(job, maxParallel, ct,
+                await ApplyFolderMetadataRecursiveAsync(job, maxParallel, gate, ct,
                     copyPermissions, permissionService, permissionResults,
                     done, total, folderProgress, dirtyFolderPaths, applyMetadata);
         }
         catch (OperationCanceledException) { completed = false; }
-        catch { }
+        catch (Exception ex)
+        {
+            // Previously a bare `catch { }` left `completed = true` — an exception on folder #1 of
+            // thousands (throttle retries exhausted, transient error) abandoned every remaining
+            // folder in the sequential `foreach` above, yet the wizard reported "Folder metadata
+            // updated" with no error visible anywhere, since this pass took no activityLog either.
+            completed = false;
+            activityLog?.Report($"⚠ Folder metadata pass stopped early: {ex.Message}");
+        }
+        finally { spService.Throttled -= onThrottle; }
         onDone?.Report(completed);
     }
 
@@ -555,6 +694,12 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
             result.ErrorMessage = "Cancelled";
             return;
         }
+        // Set once the file itself has copied/skipped successfully — used below to tell "cancelled
+        // before the file ever landed" from "file landed fine, cancellation only interrupted the
+        // best-effort permission refresh that follows". Without this distinction, a fully-copied
+        // file whose permission step was cancelled got its Success/Skipped status silently
+        // overwritten with Cancelled ("never actually attempted" per CopyResult's own status docs).
+        bool copyCompleted = false;
         try
         {
             result.Status = CopyStatus.Copying;
@@ -567,8 +712,10 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
 
             if (overwriteMode != OverwriteMode.Overwrite)
             {
-                var existing = await spService.GetFileInfoAsync(job.TargetDriveId, targetParentId, job.SourceName);
-                if (existing != null)
+                // One paginated listing per TARGET FOLDER (cached across every file in it — see
+                // GetOrBuildFolderSnapshotAsync) instead of a GetFileInfoAsync Graph call per FILE.
+                var folderSnapshot = await GetOrBuildFolderSnapshotAsync(job.TargetDriveId, targetParentId);
+                if (folderSnapshot.TryGetValue(job.SourceName, out var existing))
                 {
                     if (overwriteMode == OverwriteMode.Skip)
                     {
@@ -576,10 +723,15 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                         return;
                     }
                     // IfNewer: copy only when the source changed since the target was written.
-                    var srcMeta = await spService.GetFileMetadataAsync(job.SourceDriveId, job.SourceItemId);
-                    if (srcMeta.ModifiedDateTime is { } srcModified && existing.Value.Modified is { } tgtModified &&
-                        TimestampComparer.IsUpToDate(srcModified, tgtModified))
-                        upToDateItemId = existing.Value.ItemId;
+                    // job.SourceModified was already captured by the scan (SourceFileEntry.Modified,
+                    // see the walk below) — fall back to a per-file Graph read only on the rare miss
+                    // (an individually-selected file, which never goes through the walk, or a file
+                    // whose metadata fetch failed during the scan).
+                    var srcModified = job.SourceModified
+                        ?? (await spService.GetFileMetadataAsync(job.SourceDriveId, job.SourceItemId)).ModifiedDateTime;
+                    if (srcModified is { } sm && existing.Modified is { } tgtModified &&
+                        TimestampComparer.IsUpToDate(sm, tgtModified))
+                        upToDateItemId = existing.ItemId;
                 }
             }
 
@@ -610,6 +762,7 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
 
                 result.Status = CopyStatus.Success;
             }
+            copyCompleted = true;
 
             // Per-file permission copy (skipped if not enabled or file has inherited permissions)
             if (copyPermissions && permissionService != null && !string.IsNullOrEmpty(targetGraphItemId))
@@ -635,7 +788,7 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                                     hasUniquePermissions: true,
                                     job.SourceName, ct);
                                 if ((perm.HasActivity) && permissionResults != null)
-                                    AddPermissionRow(permissionResults, perm, result.TargetPath);
+                                    AddPermissionRow(permissionResults, perm, result);
                             }
                         }
                     }
@@ -646,10 +799,17 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         }
         catch (OperationCanceledException)
         {
-            // Cancelled, not Skipped: this item never started (or didn't finish) — Skipped
-            // otherwise means "compared and found already up to date." See CopyStatus.Cancelled.
-            result.Status       = CopyStatus.Cancelled;
-            result.ErrorMessage = "Cancelled";
+            if (!copyCompleted)
+            {
+                // Cancelled, not Skipped: this item never started (or didn't finish) — Skipped
+                // otherwise means "compared and found already up to date." See CopyStatus.Cancelled.
+                result.Status       = CopyStatus.Cancelled;
+                result.ErrorMessage = "Cancelled";
+            }
+            // else: the file itself already copied/skipped successfully (result.Status is already
+            // Success or Skipped) — cancellation only interrupted the best-effort permission
+            // refresh afterward. Leave the real outcome in place rather than reporting a fully
+            // present file as "never actually attempted".
         }
         catch (Microsoft.Graph.Models.ODataErrors.ODataError oe)
         {
@@ -752,21 +912,38 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                 else
                     System.Diagnostics.Debug.WriteLine($"[CopyCurrentVersion] page published OK");
             }
+            else if (copyPages)
+            {
+                // Fail loudly, same as the SavePage branch above: with copyPages ON, a null
+                // pageMeta here means the source canvas genuinely could not be fetched (not the
+                // "content copy disabled" case, which never reaches this branch) — the stub that
+                // CreatePageStubAsync already created is a blank page, and letting the caller mark
+                // this Success hid exactly that.
+                throw new Exception($"Page created but its source content could not be read: {metaErr ?? "unknown error"}");
+            }
             else
             {
-                result.ErrorMessage = metaErr ?? "Source page metadata unavailable";
+                // copyPages is deliberately off — pageMeta was never fetched, so this stub is an
+                // intentionally shallow copy, not a failure.
+                result.ErrorMessage = "Page copied without content (Copy Pages option is off)";
             }
         }
         else
         {
             System.Diagnostics.Debug.WriteLine($"[CopyCurrentVersion] downloading…");
             using var stream = await spService.DownloadFileAsync(job.SourceDriveId, job.SourceItemId);
-            using var ms     = new MemoryStream();
-            await stream.CopyToAsync(ms, ct);
-            ms.Position = 0;
-            System.Diagnostics.Debug.WriteLine($"[CopyCurrentVersion] downloaded {ms.Length} bytes, uploading…");
-            targetItemId = await spService.UploadFileAsync(job.TargetDriveId, targetParentId, job.SourceName, ms, overwrite);
-            System.Diagnostics.Debug.WriteLine($"[CopyCurrentVersion] upload complete, targetItemId={targetItemId}");
+            bool isLargeFile = IsLargeForBuffering(job.SourceSize);
+            if (isLargeFile) await _largeFileGate.WaitAsync(ct);
+            try
+            {
+                using var ms = CreateTransferBuffer(isLargeFile);
+                await stream.CopyToAsync(ms, ct);
+                ms.Position = 0;
+                System.Diagnostics.Debug.WriteLine($"[CopyCurrentVersion] downloaded {ms.Length} bytes, uploading…");
+                targetItemId = await spService.UploadFileAsync(job.TargetDriveId, targetParentId, job.SourceName, ms, overwrite);
+                System.Diagnostics.Debug.WriteLine($"[CopyCurrentVersion] upload complete, targetItemId={targetItemId}");
+            }
+            finally { if (isLargeFile) _largeFileGate.Release(); }
         }
 
         result.VersionsCopied = 1;
@@ -853,17 +1030,27 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
             using var stream = isLast
                 ? await spService.DownloadFileAsync(job.SourceDriveId, job.SourceItemId)
                 : await spService.DownloadVersionAsync(job.SourceDriveId, job.SourceItemId, version.Id);
-            using var ms = new MemoryStream();
-            await stream.CopyToAsync(ms, ct);
-            ms.Position = 0;
 
-            // Always overwrite during version replay: after version 1 uploads, the file exists,
-            // so the final (current) version's upload must replace it too — with overwrite=false
-            // (Skip mode) the ≥4MB upload-session path 409'd and left an OLD version as the
-            // target's current content. Skip semantics are enforced by the existence check in
-            // CopySingleFileAsync before replay ever starts.
-            targetItemId = await spService.UploadFileAsync(
-                job.TargetDriveId, targetParentId, job.SourceName, ms, overwrite: true);
+            // version.Size (this specific version's byte count) is the accurate figure; fall back to
+            // the file's current size if a version didn't report one, same fallback order
+            // MigrationJobService uses for the same decision.
+            bool isLargeFile = IsLargeForBuffering(version.Size ?? job.SourceSize);
+            if (isLargeFile) await _largeFileGate.WaitAsync(ct);
+            try
+            {
+                using var ms = CreateTransferBuffer(isLargeFile);
+                await stream.CopyToAsync(ms, ct);
+                ms.Position = 0;
+
+                // Always overwrite during version replay: after version 1 uploads, the file exists,
+                // so the final (current) version's upload must replace it too — with overwrite=false
+                // (Skip mode) the ≥4MB upload-session path 409'd and left an OLD version as the
+                // target's current content. Skip semantics are enforced by the existence check in
+                // CopySingleFileAsync before replay ever starts.
+                targetItemId = await spService.UploadFileAsync(
+                    job.TargetDriveId, targetParentId, job.SourceName, ms, overwrite: true);
+            }
+            finally { if (isLargeFile) _largeFileGate.Release(); }
 
             if (preserveMetadata)
             {
@@ -897,6 +1084,14 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                     var delErr = await spService.DeleteItemVersionAsync(
                         job.TargetDriveId, targetItemId, uploadVersionId);
                     if (delErr != null) result.ErrorMessage ??= delErr;
+                }
+                else
+                {
+                    // GetCurrentVersionIdAsync failed (transient Graph error) — previously silent,
+                    // since the `if` above simply skipped the delete with no error recorded. The
+                    // upload-time version now stays behind as a permanent duplicate entry in the
+                    // target's version history alongside the correctly-dated phantom.
+                    result.ErrorMessage ??= "Could not identify the temporary upload version to remove — an extra version may remain in history";
                 }
             }
 
@@ -938,7 +1133,7 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
     }
 
     private async Task ApplyFolderMetadataRecursiveAsync(
-        CopyJob job, int maxParallel, CancellationToken ct,
+        CopyJob job, int maxParallel, AdaptiveParallelismController gate, CancellationToken ct,
         bool copyPermissions = false,
         PermissionCopyService? permissionService = null,
         ObservableCollection<CopyResult>? permissionResults = null,
@@ -948,6 +1143,32 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         bool applyMetadata = true)
     {
         var prefix = string.IsNullOrEmpty(job.TargetSubFolderPath) ? "" : job.TargetSubFolderPath + "/";
+
+        // Folder color is written via the path-based foldercoloring endpoint, so this pass needs the
+        // target library's server-relative URL to build each folder's path. Resolved once per job
+        // (one Graph call) and only when metadata is actually being applied; a failure here just
+        // disables color for this job rather than failing the pass.
+        string? targetLibRelUrl = null;
+        if (applyMetadata)
+        {
+            try { targetLibRelUrl = await spService.GetLibraryServerRelativeUrlAsync(job.TargetDriveId); }
+            catch { /* color skipped for this job */ }
+        }
+
+        // Applies folder color, ordered BEFORE the date/author correction: the coloring endpoint
+        // writes the folder's list item, so it stamps Editor/Modified — doing it first means
+        // ApplyFileMetadataAsync overwrites those side effects. Non-fatal by design.
+        async Task StampColorIfAnyAsync(FileMetadata meta, string targetRelativePath)
+        {
+            if (string.IsNullOrEmpty(meta.ColorHex) || targetLibRelUrl == null) return;
+            try
+            {
+                await spService.StampFolderColorAsync(
+                    job.TargetSiteUrl, $"{targetLibRelUrl}/{targetRelativePath}", meta.ColorHex!, ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { /* color is cosmetic — never fail a folder over it */ }
+        }
 
         // With dirty tracking, only update the root folder if a file was copied into it or a descendant.
         bool hasRoot = !job.IsLibrary && job.SourceItemId != "root"
@@ -961,7 +1182,9 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                 job.TargetDriveId, job.TargetParentItemId, prefix + job.SourceName);
             if (applyMetadata)
             {
-                var rootMeta = await spService.GetFileMetadataAsync(job.SourceDriveId, job.SourceItemId);
+                // Folder, not a file — opt into the folder-color read (see GetFileMetadataAsync).
+                var rootMeta = await spService.GetFileMetadataAsync(job.SourceDriveId, job.SourceItemId, includeFolderColor: true);
+                await StampColorIfAnyAsync(rootMeta, prefix + job.SourceName);
                 await spService.ApplyFileMetadataAsync(job.TargetDriveId, rootTargetId, job.TargetSiteId, rootMeta);
                 if (rootMeta.ModifiedDateTime.HasValue)
                     await spService.PatchFileSystemDateAsync(job.TargetDriveId, rootTargetId,
@@ -985,7 +1208,7 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                             hasUniquePermissions: hasUnique,
                             job.SourceName, ct);
                         if (perm.HasActivity)
-                            AddPermissionRow(permissionResults, perm, $"{job.TargetSiteUrl.TrimEnd('/')}/{job.SourceName}");
+                            AddPermissionRow(permissionResults, perm, null); // folder result — no matching file row
                     }
                 }
                 catch (OperationCanceledException) { throw; }
@@ -997,7 +1220,7 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         }
 
         var subFolders = new List<(string driveId, string itemId, string relativePath)>();
-        await foreach (var item in spService.EnumerateFoldersAsync(job.SourceDriveId, job.SourceItemId))
+        await foreach (var item in spService.EnumerateFoldersAsync(job.SourceDriveId, job.SourceItemId, ct: ct))
             subFolders.Add(item);
 
         // With dirty tracking, skip subfolders that received no successful copies.
@@ -1019,13 +1242,21 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
             new ParallelOptions { MaxDegreeOfParallelism = maxParallel, CancellationToken = ct },
             async (item, innerCt) =>
             {
+                // The gate (not MaxDegreeOfParallelism) governs live concurrency: it soft-starts and
+                // shrinks on throttle, so effective width = min(maxParallel, gate limit) — see
+                // ApplyAllFolderMetadataAsync, which owns the gate and its Throttled subscription.
+                await gate.WaitAsync(innerCt);
+                try
+                {
                 var (driveId, itemId, relativePath) = item;
                 var targetPath = job.IsLibrary ? prefix + relativePath : prefix + $"{job.SourceName}/{relativePath}";
                 var targetFolderId = await spService.GetOrCreateFolderPathAsync(
                     job.TargetDriveId, job.TargetParentItemId, targetPath);
                 if (applyMetadata)
                 {
-                    var meta = await spService.GetFileMetadataAsync(driveId, itemId);
+                    // Folder, not a file — opt into the folder-color read (see GetFileMetadataAsync).
+                    var meta = await spService.GetFileMetadataAsync(driveId, itemId, includeFolderColor: true);
+                    await StampColorIfAnyAsync(meta, targetPath);
                     await spService.ApplyFileMetadataAsync(job.TargetDriveId, targetFolderId, job.TargetSiteId, meta);
                     if (meta.ModifiedDateTime.HasValue)
                         await spService.PatchFileSystemDateAsync(job.TargetDriveId, targetFolderId,
@@ -1049,7 +1280,7 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                                 hasUniquePermissions: hasUnique,
                                 System.IO.Path.GetFileName(relativePath), innerCt);
                             if (perm.HasActivity)
-                                AddPermissionRow(permissionResults, perm, $"{job.TargetSiteUrl.TrimEnd('/')}/{relativePath}");
+                                AddPermissionRow(permissionResults, perm, null); // folder result — no matching file row
                         }
                     }
                     catch (OperationCanceledException) { throw; }
@@ -1058,6 +1289,8 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
 
                 if (folderDone != null) Interlocked.Increment(ref folderDone[0]);
                 folderProgress?.Report((folderDone?[0] ?? 0, folderTotal?[0] ?? 0));
+                }
+                finally { gate.Release(); }
             });
     }
 
@@ -1094,9 +1327,6 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                 : $"{jobTargetSubFolderPath}/{relToParent}";
     }
 
-    private static CopyResult? FindResult(IEnumerable<CopyResult> results, string sourcePath)
-        => results.FirstOrDefault(r => r.SourcePath == sourcePath);
-
     private static CopyResult CreateResult(CopyJob job) => new()
     {
         FileName   = job.SourceName,
@@ -1104,9 +1334,12 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         TargetPath = job.TargetDisplayPath
     };
 
-    // Stamps the permission outcome onto the existing file row. Silently no-ops for
-    // folder-level results where no matching row exists.
-    private static void AddPermissionRow(ObservableCollection<CopyResult> results, PermissionCopyResult perm, string targetPath)
+    // Stamps the permission outcome onto the caller's own row when it has one (every per-FILE call
+    // site already holds its CopyResult in scope — no need to search for it). Pass null for
+    // folder-level results, which have no matching file row; this silently no-ops for those, same as
+    // before, but without an O(n) (or O(n)+O(n) fallback) scan of the results collection per file —
+    // on a large single-file selection with unique permissions per file, that scan was O(n²) overall.
+    private static void AddPermissionRow(ObservableCollection<CopyResult> results, PermissionCopyResult perm, CopyResult? row)
     {
         string detail;
         CopyStatus status;
@@ -1125,21 +1358,15 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
             status = CopyStatus.Success;
         }
 
-        // Match by full target path first — the same file name routinely exists in multiple
-        // folders, and a name-only match stamped the outcome on the first row with that name.
-        var row = results.FirstOrDefault(r =>
-                !r.IsPermissionResult &&
-                string.Equals(r.TargetPath, targetPath, StringComparison.OrdinalIgnoreCase))
-            ?? results.FirstOrDefault(r =>
-                !r.IsPermissionResult &&
-                string.Equals(r.FileName, perm.ItemName, StringComparison.OrdinalIgnoreCase));
-
         if (row == null) return;
 
-        System.Windows.Application.Current.Dispatcher.Invoke(() =>
-        {
-            row.PermissionStatus  = status;
-            row.PermissionDetails = detail;
-        });
+        // No explicit dispatch needed: CopyResult's property setters already marshal to the UI
+        // thread via Dispatcher.BeginInvoke (see CopyResult.OnPropertyChanged). A synchronous
+        // Dispatcher.Invoke here was both redundant and a real hazard — up to maxParallel copy
+        // threads plus the 8-wide folder/SPMI permission passes could all block on the dispatcher
+        // queue at once, the same pattern that caused the UCEERR_RENDERTHREADFAILURE crash this
+        // codebase already fixed once for CopyResult itself.
+        row.PermissionStatus  = status;
+        row.PermissionDetails = detail;
     }
 }

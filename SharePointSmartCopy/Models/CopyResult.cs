@@ -70,21 +70,23 @@ public partial class CopyResult : ObservableObject
 
     public string StatusDisplay => Status switch
     {
-        CopyStatus.Pending  => "⏳ Pending",
-        CopyStatus.Copying  => "⟳ Processing…",
-        CopyStatus.Success  => "✅ Success",
-        CopyStatus.Failed   => "❌ Failed",
-        CopyStatus.Skipped  => "⏭ Skipped",
-        _                   => string.Empty
+        CopyStatus.Pending   => "⏳ Pending",
+        CopyStatus.Copying   => "⟳ Processing…",
+        CopyStatus.Success   => "✅ Success",
+        CopyStatus.Failed    => "❌ Failed",
+        CopyStatus.Skipped   => "⏭ Skipped",
+        CopyStatus.Cancelled => "⊘ Cancelled",
+        _                    => string.Empty
     };
 
     public string StatusColor => Status switch
     {
-        CopyStatus.Success  => "#107C10",
-        CopyStatus.Failed   => "#A4262C",
-        CopyStatus.Skipped  => "#797775",
-        CopyStatus.Copying  => "#0078D4",
-        _                   => "#323130"
+        CopyStatus.Success   => "#107C10",
+        CopyStatus.Failed    => "#A4262C",
+        CopyStatus.Skipped   => "#797775",
+        CopyStatus.Copying   => "#0078D4",
+        CopyStatus.Cancelled => "#797775",
+        _                    => "#323130"
     };
 
     public string PermissionStatusDisplay => PermissionStatus switch

@@ -584,7 +584,12 @@ public class MigrationJobService(SharePointService spService)
                     // identity for that folder) from "we tried and SharePoint rejected it" — these look
                     // identical to the user (folder still shows the importing account) but have completely
                     // different causes and fixes, and conflating them was making this hard to diagnose.
-                    int foldersMissingSourceEmail = folderMetadata.Count - foldersNeedingAuthorFix.Count;
+                    // Counted from its own predicate, NOT by subtracting the list above: once that list
+                    // also admits color-only folders, subtraction silently stops counting a folder that
+                    // genuinely has no source email but does have a color — exactly the case this
+                    // warning exists to surface.
+                    int foldersMissingSourceEmail = folderMetadata
+                        .Count(kv => string.IsNullOrEmpty(kv.Value.CreatedByEmail) && string.IsNullOrEmpty(kv.Value.ModifiedByEmail));
                     if (foldersMissingSourceEmail > 0)
                         activityLog?.Report($"⚠ {foldersMissingSourceEmail:N0} folder(s) had no source Author/Modified-By email available — cannot correct those, they will show the importing account");
                     if (foldersNeedingAuthorFix.Count == 0) return;
@@ -592,7 +597,14 @@ public class MigrationJobService(SharePointService spService)
                     activityLog?.Report($"Correcting folder metadata (dates + authorship + color) for {foldersNeedingAuthorFix.Count:N0} of {folderMetadata.Count:N0} folder(s)...");
                     int authorFixFailures = 0;
                     int authorFixDone = 0;
+                    // Color failures are counted SEPARATELY from metadata failures. Folder color has no
+                    // supported write API and its field names are unverified, so a tenant where it can't
+                    // be applied is expected — letting that inflate authorFixFailures would make every
+                    // run report "could not correct metadata" for every folder and destroy the
+                    // diagnostic signal the messages below were built to preserve.
+                    int colorFailures = 0;
                     var sampleErrors = new System.Collections.Concurrent.ConcurrentBag<string>();
+                    var sampleColorErrors = new System.Collections.Concurrent.ConcurrentBag<string>();
                     await Parallel.ForEachAsync(foldersNeedingAuthorFix,
                         new ParallelOptions { MaxDegreeOfParallelism = 6, CancellationToken = cancellationToken },
                         async (kv, ct) =>
@@ -610,13 +622,21 @@ public class MigrationJobService(SharePointService spService)
                                 // Date and author go in the SAME call: a separate author-only write
                                 // after SPMI already set the correct date would bump Modified back to
                                 // "now" as a side effect (see PatchFolderMetadataAsync's doc comment).
-                                var err = await spService.PatchFolderMetadataAsync(
+                                // folderRelUrl is the folder's server-relative path, which the
+                                // foldercoloring endpoint needs (it's path-based, not ID-based).
+                                var (err, colorWarning) = await spService.PatchFolderMetadataAsync(
                                     targetSiteUrl, listId, guid!, meta.CreatedDateTime, meta.ModifiedDateTime,
-                                    meta.CreatedByEmail, meta.ModifiedByEmail, meta.ColorTag, meta.ColorHex);
+                                    meta.CreatedByEmail, meta.ModifiedByEmail, meta.ColorTag, meta.ColorHex,
+                                    folderServerRelativeUrl: folderRelUrl);
                                 if (err != null)
                                 {
                                     Interlocked.Increment(ref authorFixFailures);
                                     sampleErrors.Add($"{(relKey.Length == 0 ? "(library root)" : relKey)}: {err}");
+                                }
+                                if (colorWarning != null)
+                                {
+                                    Interlocked.Increment(ref colorFailures);
+                                    sampleColorErrors.Add($"{(relKey.Length == 0 ? "(library root)" : relKey)}: {colorWarning}");
                                 }
                             }
                             // Previously silent for the whole pass — on a large tree under sustained
@@ -643,6 +663,14 @@ public class MigrationJobService(SharePointService spService)
                     else
                     {
                         activityLog?.Report($"✓ Folder metadata verified for {foldersNeedingAuthorFix.Count:N0} folder(s)");
+                    }
+                    // Separate line, and deliberately worded as informational: dates and authorship
+                    // succeeded above regardless. Folder color has no supported write API, so a tenant
+                    // that rejects it is an expected outcome, not a migration failure.
+                    if (colorFailures > 0)
+                    {
+                        var colorExamples = string.Join(" | ", sampleColorErrors.Distinct().Take(2));
+                        activityLog?.Report($"ℹ Folder color could not be applied to {colorFailures:N0} folder(s) — dates and authorship were still corrected. Example(s): {colorExamples}");
                     }
                 }
 

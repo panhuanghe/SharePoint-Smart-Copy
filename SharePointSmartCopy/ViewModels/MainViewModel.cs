@@ -1984,9 +1984,19 @@ public partial class MainViewModel : ObservableObject
                                         var pageCols = await SpService.GetLibraryColumnsAsync(
                                             SourceUrl.TrimEnd('/'), pagesListId);
                                         if (pageCols.Count > 0)
-                                            pageBulkCache = await SpService.BulkReadCustomFieldsAsync(
+                                        {
+                                            // BulkReadCustomFieldsAsync keys its result by bare item ID;
+                                            // CopyService's lookup (ApplyCustomColumnsIfAny) uses the
+                                            // composite "{listId}:{itemId}" key the library-scope call
+                                            // sites already re-key to (see the def.SourceListId path
+                                            // above) — without this, every lookup here missed and page
+                                            // custom columns silently never applied, with no error.
+                                            var rawPageFields = await SpService.BulkReadCustomFieldsAsync(
                                                 SourceUrl.TrimEnd('/'), pagesListId, pageCols,
                                                 ct: _copyCts.Token);
+                                            pageBulkCache = rawPageFields.ToDictionary(
+                                                kvp => $"{pagesListId}:{kvp.Key}", kvp => kvp.Value);
+                                        }
                                     }
                                     if (CopyPermissions)
                                         pagePermFlags = await SpService.BulkReadPermissionFlagsAsync(
