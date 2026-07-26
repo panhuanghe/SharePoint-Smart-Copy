@@ -544,6 +544,17 @@ public class SharePointService
     // Set type derived from it. See IsSpecialContainer.
     private const string DocumentSetContentTypeIdPrefix = "0x0120D520";
 
+    // Hidden list-item fields backing SharePoint's "Customize folder > color" feature. These
+    // internal names are UNCONFIRMED against a live tenant — best-guess names commonly cited for
+    // this feature as of 2026-07-25, not verified via a raw ListItemAllFields probe (see
+    // GetFolderCurrentMetadataAsync for the call shape a live-tenant check would use: same URL with
+    // no $select, grep the response for "Color"). Both reads and writes degrade gracefully if these
+    // are wrong or absent on a given tenant/rollout — a missing field just reads back null, and a
+    // failed color write only fails the color write (see PatchFolderColorViaCsomAsync), never the
+    // Author/Editor/Created/Modified correction it runs alongside.
+    private const string FolderColorTagFieldName = "_ColorTag";
+    private const string FolderColorHexFieldName = "_ColorHexValue";
+
     // Whether a folder-like DriveItem is a special container that must NOT be walked into as a
     // plain folder (its contents are handled by a server-side special-folder copy instead — see
     // SourceFileEntry.IsSpecialFolder / CopySpecialFolderAsync). Detected entirely from the fields
@@ -563,6 +574,19 @@ public class SharePointService
         if (item.Package != null) return true;
         var ctId = item.ListItem?.ContentType?.Id;
         return ctId != null && ctId.StartsWith(DocumentSetContentTypeIdPrefix, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Reads the two folder-color fields (see FolderColorTagFieldName/FolderColorHexFieldName) off
+    // an already-fetched DriveItem's expanded listItem.fields — returns (null, null) for a plain,
+    // uncolored folder or a tenant where the field doesn't exist, same "absent means no value, not
+    // an error" contract as GetFolderProgIdAsync.
+    private static (string? colorTag, string? colorHex) GetFolderColorValues(DriveItem? item)
+    {
+        var additional = item?.ListItem?.Fields?.AdditionalData;
+        if (additional == null) return (null, null);
+        string? colorTag = additional.TryGetValue(FolderColorTagFieldName, out var ct) && ct != null ? ct.ToString() : null;
+        string? colorHex = additional.TryGetValue(FolderColorHexFieldName, out var ch) && ch != null ? ch.ToString() : null;
+        return (string.IsNullOrEmpty(colorTag) ? null : colorTag, string.IsNullOrEmpty(colorHex) ? null : colorHex);
     }
 
     // Cheap special-container check for a folder that is itself the ROOT of a user's directly
@@ -1236,7 +1260,13 @@ public class SharePointService
     public async Task<FileMetadata> GetFileMetadataAsync(string driveId, string itemId)
     {
         var item = await Graph.Drives[driveId].Items[itemId].GetAsync(cfg =>
-            cfg.QueryParameters.Select = ["createdDateTime", "lastModifiedDateTime", "createdBy", "lastModifiedBy", "size"]);
+        {
+            cfg.QueryParameters.Select = ["createdDateTime", "lastModifiedDateTime", "createdBy", "lastModifiedBy", "size"];
+            // Only meaningful for folders (see FolderColorTagFieldName) — a plain file simply
+            // won't carry these fields, so this is a no-op read for every file this method serves.
+            cfg.QueryParameters.Expand = [$"listItem($expand=fields($select={FolderColorTagFieldName},{FolderColorHexFieldName}))"];
+        });
+        var (colorTag, colorHex) = GetFolderColorValues(item);
 
         return new FileMetadata
         {
@@ -1245,6 +1275,8 @@ public class SharePointService
             ModifiedDateTime = item?.LastModifiedDateTime,
             ModifiedByEmail  = GetIdentityEmail(item?.LastModifiedBy?.User),
             Size             = item?.Size,
+            ColorTag         = colorTag,
+            ColorHex         = colorHex,
         };
     }
 
@@ -1283,9 +1315,13 @@ public class SharePointService
         try
         {
             var root = await Graph.Drives[rootDriveId].Root.GetAsync(cfg =>
-                cfg.QueryParameters.Select = ["id", "createdDateTime", "lastModifiedDateTime", "createdBy", "lastModifiedBy"],
-                cancellationToken: ct);
+            {
+                cfg.QueryParameters.Select = ["id", "createdDateTime", "lastModifiedDateTime", "createdBy", "lastModifiedBy"];
+                cfg.QueryParameters.Expand = [$"listItem($expand=fields($select={FolderColorTagFieldName},{FolderColorHexFieldName}))"];
+            }, cancellationToken: ct);
             if (root != null)
+            {
+                var (rootColorTag, rootColorHex) = GetFolderColorValues(root);
                 result[string.Empty] = new FileMetadata
                 {
                     CreatedDateTime  = root.CreatedDateTime,
@@ -1293,7 +1329,10 @@ public class SharePointService
                     ModifiedDateTime = root.LastModifiedDateTime,
                     ModifiedByEmail  = GetIdentityEmail(root.LastModifiedBy?.User),
                     ProgId           = await GetFolderProgIdAsync(rootDriveId, "root"),
+                    ColorTag         = rootColorTag,
+                    ColorHex         = rootColorHex,
                 };
+            }
         }
         catch { /* keep placeholder */ }
 
@@ -1326,6 +1365,8 @@ public class SharePointService
                         ModifiedByEmail  = metadata.ModifiedByEmail,
                         Size             = metadata.Size,
                         ProgId           = progId,
+                        ColorTag         = metadata.ColorTag,
+                        ColorHex         = metadata.ColorHex,
                         CustomFields     = metadata.CustomFields,
                     };
                 }
@@ -1636,10 +1677,12 @@ public class SharePointService
     public async Task<string?> PatchFolderMetadataAsync(
         string siteUrl, string listId, string folderUniqueId,
         DateTimeOffset? createdDateTime, DateTimeOffset? modifiedDateTime,
-        string? createdByEmail, string? modifiedByEmail)
+        string? createdByEmail, string? modifiedByEmail,
+        string? colorTag = null, string? colorHex = null)
     {
         if (createdDateTime == null && modifiedDateTime == null &&
-            string.IsNullOrEmpty(createdByEmail) && string.IsNullOrEmpty(modifiedByEmail))
+            string.IsNullOrEmpty(createdByEmail) && string.IsNullOrEmpty(modifiedByEmail) &&
+            string.IsNullOrEmpty(colorTag) && string.IsNullOrEmpty(colorHex))
             return null;
 
         // FAST PATH (added 2026-07-10) — the whole-tree repair fix made this correction pass run
@@ -1653,16 +1696,23 @@ public class SharePointService
         // EnsureUser/digest/CSOM entirely for that folder. Only a folder that's actually wrong (new,
         // never corrected, or somehow reverted) pays the full cost.
         int folderItemId;
+        // Whether the color write should even be attempted — unknown (assume yes, matching the
+        // pre-existing author/date behavior in the fallback branch below) unless the fast-path read
+        // below confirms the target already matches the source.
+        bool needsColorWrite = !string.IsNullOrEmpty(colorTag) || !string.IsNullOrEmpty(colorHex);
         var current = await GetFolderCurrentMetadataAsync(siteUrl, folderUniqueId);
         if (current != null)
         {
-            var (id, actualAuthorEmail, actualEditorEmail, actualCreated, actualModified) = current.Value;
+            var (id, actualAuthorEmail, actualEditorEmail, actualCreated, actualModified, actualColorTag, actualColorHex) = current.Value;
             folderItemId = id;
             bool authorOk = string.IsNullOrEmpty(createdByEmail) || EmailsMatch(actualAuthorEmail, createdByEmail);
             bool editorOk = string.IsNullOrEmpty(modifiedByEmail) || EmailsMatch(actualEditorEmail, modifiedByEmail);
             bool createdOk = createdDateTime == null || DatesClose(actualCreated, createdDateTime.Value);
             bool modifiedOk = modifiedDateTime == null || DatesClose(actualModified, modifiedDateTime.Value);
-            if (authorOk && editorOk && createdOk && modifiedOk)
+            bool colorOk = (string.IsNullOrEmpty(colorTag) || string.Equals(actualColorTag, colorTag, StringComparison.OrdinalIgnoreCase))
+                        && (string.IsNullOrEmpty(colorHex) || string.Equals(actualColorHex, colorHex, StringComparison.OrdinalIgnoreCase));
+            needsColorWrite = !colorOk;
+            if (authorOk && editorOk && createdOk && modifiedOk && colorOk)
                 return null; // already correct — nothing to write
         }
         else
@@ -1740,7 +1790,7 @@ public class SharePointService
             }
         }
 
-        if (createdById == null && modifiedById == null && createdDateTime == null && modifiedDateTime == null)
+        if (createdById == null && modifiedById == null && createdDateTime == null && modifiedDateTime == null && !needsColorWrite)
             return skipped.Count > 0 ? $"Nothing to write — skipped: {string.Join(", ", skipped)}" : null;
 
         // TENTH attempt 2026-07-09 — REST is now fully exhausted (Person-field format x2, REST path
@@ -1758,13 +1808,106 @@ public class SharePointService
         string? csomError = await PatchFolderViaCsomAsync(
             siteUrl, listId, folderItemId, createdById, modifiedById, createdDateTime, modifiedDateTime,
             resolvedCreatedBy, resolvedModifiedBy);
-        if (csomError != null)
-            return csomError + (skipped.Count > 0 ? $" | also skipped: {string.Join(", ", skipped)}" : "");
 
-        // The write itself succeeded, but still report it as a failure if a person field had
-        // to be skipped up front — the folder is only partially corrected (date fixed, that
-        // one person field still shows the importing account), and that's not "no error".
-        return skipped.Count > 0 ? $"Partially corrected — skipped: {string.Join(", ", skipped)}" : null;
+        // Color is written via a SEPARATE CSOM call, deliberately decoupled from the Author/Editor/
+        // date UpdateOverwriteVersion() call above: color isn't a Person field so it doesn't need
+        // that special update mode, and keeping it separate means a wrong/unrecognized field name
+        // (see FolderColorTagFieldName's doc comment) only ever fails the color write, never the
+        // date/authorship correction this method exists for.
+        string? colorError = needsColorWrite
+            ? await PatchFolderColorViaCsomAsync(siteUrl, listId, folderItemId, colorTag, colorHex)
+            : null;
+
+        // The write(s) may have succeeded, but still report a failure if anything had to be
+        // skipped or errored — a folder is only partially corrected otherwise (e.g. date fixed,
+        // that one person field still shows the importing account), and that's not "no error".
+        var problems = new List<string>();
+        if (csomError != null) problems.Add(csomError);
+        if (colorError != null) problems.Add(colorError);
+        if (skipped.Count > 0) problems.Add($"skipped: {string.Join(", ", skipped)}");
+        return problems.Count > 0 ? string.Join(" | ", problems) : null;
+    }
+
+    // Writes a folder's color field(s) via CSOM's ProcessQuery endpoint, using plain Update() —
+    // color isn't a Person field, so it doesn't need PatchFolderViaCsomAsync's UpdateOverwriteVersion()
+    // mode. Deliberately a separate ProcessQuery call from the date/authorship patch: a wrong or
+    // unrecognized internal field name (see FolderColorTagFieldName's doc comment — these names are
+    // unconfirmed against a live tenant) fails only this call, never the date/authorship correction
+    // PatchFolderMetadataAsync exists for.
+    private async Task<string?> PatchFolderColorViaCsomAsync(
+        string siteUrl, string listId, int itemId, string? colorTag, string? colorHex)
+    {
+        if (string.IsNullOrEmpty(colorTag) && string.IsNullOrEmpty(colorHex))
+            return null;
+
+        string? digest = await GetFormDigestAsync(siteUrl);
+        if (digest == null)
+            return "Could not obtain a request digest for the folder color CSOM call";
+
+        const string clientContextTypeId = "{3747adcd-a3c3-41b9-bfab-4a64dd2f1e0a}";
+        var objectPaths = new StringBuilder();
+        objectPaths.Append($"<StaticProperty Id=\"1\" TypeId=\"{clientContextTypeId}\" Name=\"Current\" />");
+        objectPaths.Append("<Property Id=\"2\" ParentId=\"1\" Name=\"Web\" />");
+        objectPaths.Append("<Property Id=\"3\" ParentId=\"2\" Name=\"Lists\" />");
+        objectPaths.Append($"<Method Id=\"4\" ParentId=\"3\" Name=\"GetById\"><Parameters><Parameter Type=\"Guid\">{listId}</Parameter></Parameters></Method>");
+        objectPaths.Append($"<Method Id=\"5\" ParentId=\"4\" Name=\"GetItemById\"><Parameters><Parameter Type=\"Number\">{itemId}</Parameter></Parameters></Method>");
+
+        var actions = new StringBuilder();
+        int nextId = 10;
+        void SetStringField(string fieldName, string value)
+        {
+            actions.Append($"<Method Name=\"SetFieldValue\" Id=\"{nextId++}\" ObjectPathId=\"5\"><Parameters>" +
+                $"<Parameter Type=\"String\">{System.Security.SecurityElement.Escape(fieldName)}</Parameter>" +
+                $"<Parameter Type=\"String\">{System.Security.SecurityElement.Escape(value)}</Parameter>" +
+                "</Parameters></Method>");
+        }
+        if (!string.IsNullOrEmpty(colorTag)) SetStringField(FolderColorTagFieldName, colorTag);
+        if (!string.IsNullOrEmpty(colorHex)) SetStringField(FolderColorHexFieldName, colorHex);
+        actions.Append($"<Method Name=\"Update\" Id=\"{nextId++}\" ObjectPathId=\"5\" />");
+
+        var requestXml =
+            "<Request AddExpandoFieldTypeSuffix=\"true\" SchemaVersion=\"15.0.0.0\" LibraryVersion=\"16.0.0.0\" " +
+            "ApplicationName=\"SharePointSmartCopy\" xmlns=\"http://schemas.microsoft.com/sharepoint/clientquery/2009\">" +
+            $"<Actions>{actions}</Actions><ObjectPaths>{objectPaths}</ObjectPaths></Request>";
+
+        try
+        {
+            var url = $"{siteUrl.TrimEnd('/')}/_vti_bin/client.svc/ProcessQuery";
+            using var response = await SendSharePointRequestAsync(token =>
+            {
+                var r = new HttpRequestMessage(HttpMethod.Post, url);
+                r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                r.Headers.Add("X-RequestDigest", digest);
+                r.Headers.Accept.ParseAdd("application/json");
+                r.Content = new StringContent(requestXml, System.Text.Encoding.UTF8, "text/xml");
+                return r;
+            }, siteUrl);
+
+            var body = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode)
+                return $"folder color HTTP {(int)response.StatusCode}: {body[..Math.Min(body.Length, 300)]}";
+
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.ValueKind == JsonValueKind.Array && doc.RootElement.GetArrayLength() > 0)
+            {
+                var first = doc.RootElement[0];
+                if (first.ValueKind == JsonValueKind.Object &&
+                    first.TryGetProperty("ErrorInfo", out var errInfo) &&
+                    errInfo.ValueKind == JsonValueKind.Object)
+                {
+                    var msg = errInfo.TryGetProperty("ErrorMessage", out var m) ? m.GetString() : "unknown CSOM error";
+                    // A wrong/unrecognized field name is expected here on a tenant where
+                    // FolderColorTagFieldName/FolderColorHexFieldName don't match reality — this is
+                    // deliberately non-fatal to the caller's overall date/authorship correction.
+                    return $"folder color not applied — {msg}";
+                }
+            }
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return $"folder color CSOM exception: {ex.Message}";
+        }
     }
 
     // Sets a folder's Author/Editor/Created/Modified via CSOM's ProcessQuery endpoint, using
@@ -1908,16 +2051,18 @@ public class SharePointService
         catch { return null; }
     }
 
-    // Single cheap read of a folder's CURRENT Id/Author/Editor/Created/Modified, used by
+    // Single cheap read of a folder's CURRENT Id/Author/Editor/Created/Modified/color, used by
     // PatchFolderMetadataAsync's fast path to decide whether any write is needed at all. Returns
     // null on any failure so the caller can fall back to the old (slower but proven) resolution.
-    private async Task<(int ItemId, string? AuthorEmail, string? EditorEmail, DateTimeOffset? Created, DateTimeOffset? Modified)?>
+    // The color fields simply come back null if FolderColorTagFieldName/FolderColorHexFieldName
+    // don't exist on this list — same "absent means no value" contract as everywhere else.
+    private async Task<(int ItemId, string? AuthorEmail, string? EditorEmail, DateTimeOffset? Created, DateTimeOffset? Modified, string? ColorTag, string? ColorHex)?>
         GetFolderCurrentMetadataAsync(string siteUrl, string folderUniqueId)
     {
         try
         {
             var url = $"{siteUrl.TrimEnd('/')}/_api/web/GetFolderById('{folderUniqueId}')/ListItemAllFields" +
-                "?$select=Id,Author/EMail,Editor/EMail,Created,Modified&$expand=Author,Editor";
+                $"?$select=Id,Author/EMail,Editor/EMail,Created,Modified,{FolderColorTagFieldName},{FolderColorHexFieldName}&$expand=Author,Editor";
             using var response = await SendSharePointRequestAsync(token =>
             {
                 var r = new HttpRequestMessage(HttpMethod.Get, url);
@@ -1940,8 +2085,12 @@ public class SharePointService
                 DateTimeOffset.TryParse(c.GetString(), out var cv) ? cv : null;
             DateTimeOffset? modified = root.TryGetProperty("Modified", out var m) && m.ValueKind == JsonValueKind.String &&
                 DateTimeOffset.TryParse(m.GetString(), out var mv) ? mv : null;
+            string? colorTag = root.TryGetProperty(FolderColorTagFieldName, out var ct) && ct.ValueKind == JsonValueKind.String
+                ? ct.GetString() : null;
+            string? colorHex = root.TryGetProperty(FolderColorHexFieldName, out var ch) && ch.ValueKind == JsonValueKind.String
+                ? ch.GetString() : null;
 
-            return (idEl.GetInt32(), authorEmail, editorEmail, created, modified);
+            return (idEl.GetInt32(), authorEmail, editorEmail, created, modified, colorTag, colorHex);
         }
         catch { return null; }
     }
@@ -2011,7 +2160,8 @@ public class SharePointService
 
     private async Task<string?> PatchTimestampsViaRestAsync(
         string driveId, string itemId, DateTimeOffset? modified, DateTimeOffset? created,
-        string? createdByEmail = null, string? modifiedByEmail = null)
+        string? createdByEmail = null, string? modifiedByEmail = null,
+        string? colorTag = null, string? colorHex = null)
     {
         var ids = await GetSharePointIdsAsync(driveId, itemId);
         if (ids == null) return "SP IDs unavailable — item not found or sharepointIds not propagated";
@@ -2038,6 +2188,16 @@ public class SharePointService
             formValues.Add(new { FieldName = "Editor", FieldValue = $"i:0#.f|membership|{modifiedByEmail}" });
         if (!string.IsNullOrEmpty(createdByEmail))
             formValues.Add(new { FieldName = "Author", FieldValue = $"i:0#.f|membership|{createdByEmail}" });
+        // Only meaningful for folders (see FolderColorTagFieldName) — harmless no-op for a file
+        // since FileMetadata.ColorTag/ColorHex are only ever populated for folders. Unlike the
+        // SPMI/CSOM color write, this rides in the SAME ValidateUpdateListItem call as the other
+        // fields: REST validates/applies each formValue independently, so a wrong/unrecognized
+        // color field name here only shows up as its own per-field error below, never blocking
+        // Modified/Created/Author/Editor.
+        if (!string.IsNullOrEmpty(colorTag))
+            formValues.Add(new { FieldName = FolderColorTagFieldName, FieldValue = colorTag });
+        if (!string.IsNullOrEmpty(colorHex))
+            formValues.Add(new { FieldName = FolderColorHexFieldName, FieldValue = colorHex });
 
         if (formValues.Count == 0) return null;
 
@@ -2098,7 +2258,8 @@ public class SharePointService
     {
         return await PatchTimestampsViaRestAsync(driveId, itemId,
             metadata.ModifiedDateTime, metadata.CreatedDateTime,
-            metadata.CreatedByEmail, metadata.ModifiedByEmail);
+            metadata.CreatedByEmail, metadata.ModifiedByEmail,
+            metadata.ColorTag, metadata.ColorHex);
     }
 
     public async Task<string?> GetCurrentVersionIdAsync(string driveId, string itemId)

@@ -8,5 +8,12 @@ public class FileMetadata
     public string?         ModifiedByEmail  { get; init; }
     public long?           Size             { get; init; }
     public string?         ProgId           { get; init; }
+
+    // SharePoint's hidden "Customize folder > color" fields — see SharePointService's
+    // FolderColorTagFieldName/FolderColorHexFieldName constants for the internal names used
+    // to read/write these (unconfirmed against a live tenant; best-guess names).
+    public string?         ColorTag         { get; init; }
+    public string?         ColorHex         { get; init; }
+
     public Dictionary<string, object?> CustomFields { get; init; } = [];
 }

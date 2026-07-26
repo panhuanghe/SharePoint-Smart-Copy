@@ -975,7 +975,7 @@
                                         <TextBlock.ToolTip>
                                             <ToolTip MaxWidth="280">
                                                 <TextBlock TextWrapping="Wrap" FontSize="12"
-                                                           Text="Preserves Created By, Created Date, Modified By, and Modified Date on every copied item. When off, items appear as created by you today."/>
+                                                           Text="Preserves Created By, Created Date, Modified By, and Modified Date on every copied item, and the folder color (if any) on copied folders. When off, items appear as created by you today."/>
                                             </ToolTip>
                                         </TextBlock.ToolTip>
                                     </TextBlock>
@@ -993,7 +993,7 @@
                                         <TextBlock.ToolTip>
                                             <ToolTip MaxWidth="280">
                                                 <TextBlock TextWrapping="Wrap" FontSize="12"
-                                                           Text="On: repairs folder Created/Modified dates and authors for every folder in the selection on each run — needed to fix folder metadata on an already-copied target, but adds a per-folder scan that runs even when every file is skipped. Off: only folders that receive new files this run are dated, making repeated 'mostly skipped' runs much faster. Applies only when Preserve metadata is on."/>
+                                                           Text="On: repairs folder Created/Modified dates, authors, and color for every folder in the selection on each run — needed to fix folder metadata on an already-copied target, but adds a per-folder scan that runs even when every file is skipped. Off: only folders that receive new files this run are corrected, making repeated 'mostly skipped' runs much faster. Applies only when Preserve metadata is on."/>
                                             </ToolTip>
                                         </TextBlock.ToolTip>
                                     </TextBlock>

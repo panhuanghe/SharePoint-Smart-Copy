@@ -571,8 +571,13 @@ public class MigrationJobService(SharePointService spService)
                 // a separate author-only write would otherwise reset Modified to "now".
                 async Task CorrectFolderMetadataAsync()
                 {
+                    // Also includes folders whose ONLY correction need is color (see FileMetadata.
+                    // ColorTag/ColorHex) — SPMI's <Folder> manifest element carries neither
+                    // Author/ModifiedBy nor color, so a folder with no author/editor to fix but a
+                    // source color set would otherwise never reach PatchFolderMetadataAsync at all.
                     var foldersNeedingAuthorFix = folderMetadata
-                        .Where(kv => !string.IsNullOrEmpty(kv.Value.CreatedByEmail) || !string.IsNullOrEmpty(kv.Value.ModifiedByEmail))
+                        .Where(kv => !string.IsNullOrEmpty(kv.Value.CreatedByEmail) || !string.IsNullOrEmpty(kv.Value.ModifiedByEmail)
+                                  || !string.IsNullOrEmpty(kv.Value.ColorTag) || !string.IsNullOrEmpty(kv.Value.ColorHex))
                         .ToList();
                     // Distinguish "we never had a source email to try" (folderMetadata's CreatedByEmail/
                     // ModifiedByEmail came back null — GetIdentityEmail found no email/UPN on the Graph
@@ -584,7 +589,7 @@ public class MigrationJobService(SharePointService spService)
                         activityLog?.Report($"⚠ {foldersMissingSourceEmail:N0} folder(s) had no source Author/Modified-By email available — cannot correct those, they will show the importing account");
                     if (foldersNeedingAuthorFix.Count == 0) return;
 
-                    activityLog?.Report($"Correcting folder metadata (dates + authorship) for {foldersNeedingAuthorFix.Count:N0} of {folderMetadata.Count:N0} folder(s)...");
+                    activityLog?.Report($"Correcting folder metadata (dates + authorship + color) for {foldersNeedingAuthorFix.Count:N0} of {folderMetadata.Count:N0} folder(s)...");
                     int authorFixFailures = 0;
                     int authorFixDone = 0;
                     var sampleErrors = new System.Collections.Concurrent.ConcurrentBag<string>();
@@ -607,7 +612,7 @@ public class MigrationJobService(SharePointService spService)
                                 // "now" as a side effect (see PatchFolderMetadataAsync's doc comment).
                                 var err = await spService.PatchFolderMetadataAsync(
                                     targetSiteUrl, listId, guid!, meta.CreatedDateTime, meta.ModifiedDateTime,
-                                    meta.CreatedByEmail, meta.ModifiedByEmail);
+                                    meta.CreatedByEmail, meta.ModifiedByEmail, meta.ColorTag, meta.ColorHex);
                                 if (err != null)
                                 {
                                     Interlocked.Increment(ref authorFixFailures);
