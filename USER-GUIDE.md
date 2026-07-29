@@ -2,7 +2,7 @@
 
 *Copy files and folders between SharePoint Online sites*
 
-**Version 3.4.0  ·  July 2026**
+**Version 3.4.1  ·  July 2026**
 
 ---
 
@@ -211,7 +211,7 @@ Configure how the copy operation should behave:
   - **If newer** — files are copied only when the source is more recently modified than the target. Files already up to date are recorded as Skipped.
 - **Copy versions** — when checked, SharePoint version history is copied alongside each file. Requires versioning to be enabled on the source library.
 - **Parallel copies** — controls how many files (or Migration API jobs) run simultaneously. The default of 4 is a good balance; raise to 8 or 16 on a fast connection for large batches.
-- **Preserve metadata** — when checked, folder Created/Modified dates and Author/Editor are copied to the target. The **Re-apply folder metadata every run** option underneath it (on by default) controls whether that repair runs for every folder on every run, or only for folders receiving new files this run — turning it off speeds up repeated incremental runs on large libraries where most files are already up to date.
+- **Preserve metadata** — when checked, folder Created/Modified dates, Author/Editor, and custom folder color are copied to the target. The **Re-apply folder metadata every run** option underneath it (on by default) controls whether that repair runs for every folder on every run, or only for folders receiving new files this run — turning it off speeds up repeated incremental runs on large libraries where most files are already up to date.
 
 When **Copy versions** is enabled, two additional controls appear:
 

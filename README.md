@@ -60,7 +60,7 @@ Choose from four copy scopes in a step-by-step wizard:
 
 **Files scope:**
 - Full version history — version numbers, dates, and per-version editors preserved exactly
-- Folder creation/modification dates and authors preserved on target, with an option to limit the repair to newly-copied folders for faster repeated incremental runs
+- Folder creation/modification dates, authors, and custom folder color preserved on target, with an option to limit the repair to newly-copied folders for faster repeated incremental runs
 - Bulk copy with 1–16 parallel operations
 - Migration API mode for high-fidelity large batches; Enhanced REST for small or quick copies
 - Migration API engages whenever selected — independent of the Copy Versions toggle

@@ -4,6 +4,47 @@ All notable changes to SharePoint Smart Copy are documented here.
 
 ---
 
+## 3.4.1 — 2026-07-29
+
+### Added
+
+- **Folder color preserved** — when Preserve Metadata is on, a source folder's custom color (SharePoint's "Customize folder > color" feature) is now read and stamped onto the corresponding target folder, alongside the existing Created/Modified/Author/Editor repair. Applied via SharePoint's dedicated color-stamping endpoint, before the date/author correction pass runs — reversed order silently reverted Author/Editor to the importing account on every colored folder, since the color endpoint's own write also stamps Editor/Modified. Read/write are best-effort: an unsupported tenant or renamed internal field name never disables the rest of the metadata repair, and color failures are counted and logged separately so they don't inflate "could not correct metadata."
+
+### Changed
+
+- **Copy-If-Newer re-runs are dramatically cheaper in Enhanced REST mode** — a per-target-folder existence/date snapshot (one listing per folder) replaces two Graph calls per *file*; on an all-skip re-run of a 100,000-file library this cuts roughly 200,000 round trips down to about 10,000.
+- **SharePoint REST/CSOM calls needed to correct a folder's metadata are now cached instead of re-fetched per folder** — the form digest (site-scoped, ~30 min valid) and each resolved user's SharePoint ID are now reused across the whole run instead of being re-requested for every single folder, cutting a documented 39-minute correction phase by roughly 40%.
+- **SPMI folder metadata now reuses folder identities the source scan already discovered**, instead of a separate re-walk of the whole tree (Enhanced REST) or an ancestor "hops up" derivation from a nearby file (Migration API) — eliminates the redundant walk entirely and removes several thousand extra Graph calls per run on a large, deeply-nested library. This also fixes a real correctness bug: the old ancestor-derivation could occasionally resolve the wrong folder — including, in one observed case, stamping the *target library root itself* with an unrelated folder's metadata.
+- **Enhanced REST's folder-metadata pass is now throttle-aware** — it previously ran at fixed width with no backoff at all, immediately after the copy phase had already depleted the tenant's throttle budget.
+- Several large-scale bookkeeping structures (per-file result counters, per-folder path strings, version-list lookups during replay, the 250,000-task startup for a very large copy) were replaced with versions that don't re-scan or re-allocate at that same wasteful scale — cumulatively, meaningfully less CPU/memory overhead on very large (100,000+ file) runs, with no behavior change.
+- **"Copy all versions" (or a version cap above 250) is now clamped to Migration API's real per-file version ceiling** instead of silently forming a batch that fails every import attempt and reproduces itself identically on retry; the activity log now says so explicitly when it happens.
+- **Migration API's prep/import pipeline no longer leaves work running unobserved after a failure** — if either side of the download→package or package→import pipeline failed unexpectedly, the other side previously kept running (or hung waiting on a channel nobody was draining anymore) after the failure had already started tearing down the resources it depended on.
+- **Library and Site-scope copies now correctly track "updating metadata" while their background folder-correction passes are still running** — previously the wizard could report a run complete (and allow navigating away or closing the app) while folder dates/authors/colors for one or more libraries were still being written in the background.
+
+### Fixed
+
+- **Permission-flag bulk read no longer silently truncates on a failed page** — on a library with 5,000+ items, a throttled page partway through previously made every item past that point copy with inherited permissions and no error, while the run still reported Success.
+- **A page copy that fails partway (throttled REST call, or a missing site URL) is no longer reported as Success** — it previously left an empty stub at the target that counted as a success and was skipped on a later Copy-If-Newer re-run.
+- **A fully-copied file whose post-copy permission step is interrupted no longer gets overwritten to "Cancelled"** — the file's real Success/Skipped outcome is now preserved, and the cancellation (if any) is reported separately.
+- **A single throttled lookup-column resolution no longer poisons that value for the rest of the session** — every other file referencing the same lookup value previously lost that column silently, for the remainder of the run.
+- **The folder-metadata pass no longer reports "complete" after abandoning every remaining folder following one failure** — a single folder's throttle-exhausted correction used to silently end the whole pass early with no error.
+- **Permission read failures are now distinguished from "this item genuinely has no unique permissions"** — previously reported identically as a clean, zero-item success.
+- **A failed lookup during per-version replay is now surfaced as an error** instead of silently leaving a duplicate phantom version behind with no indication anything went wrong.
+- **Existing-file listings during an Overwrite pre-flight no longer silently truncate on a failed page** — a partial listing could previously cause SharePoint's Migration API to reject files as "already exists" that the pre-flight should have already cleared.
+- **Folder existence/delete checks now distinguish "genuinely not there" from a transient failure**, matching a fix already applied to the equivalent file-level checks — a locked or checked-out special folder (e.g. a OneNote notebook) now reports its real cause instead of a misleading "already exists."
+- **Site-scope Site Pages copies no longer silently drop custom column values** due to a cache-key mismatch specific to that scope; Library and Files-scope copies were unaffected.
+- **A truncated page during version-count batching can no longer silently under-count a file's versions**, which could otherwise push that file's batch over the Migration API entry ceiling and fail its import.
+- **"Re-apply folder metadata every run" now actually has an effect in Enhanced REST mode** — it previously only worked for Migration API mode; an Enhanced REST re-run with the option checked silently did nothing.
+- **Enhanced REST file transfers are now bounded by the same memory budget and large-file gate Migration API already had** — previously unbounded, so many large files copying in parallel could exhaust process memory the same way a documented Migration API incident once did.
+- **Newly-created empty folders in Enhanced REST mode now receive their metadata pass** — previously created with today's date and the copying account's name, never corrected afterward.
+- Fixed as a side effect of the counter/lookup rework above: a folder-level permission failure can no longer be misattributed to an unrelated file that happens to share its name.
+- **Copying a page whose filename contains `#`, `&`, or `+` no longer fails to be found on the source** — the lookup wasn't URL-encoding the filename before building the request.
+- **The custom-column definition cache is now cleared at the start of every run** — a column added or retyped on the target between two runs (without restarting the app) was previously still resolved against the stale definition from the earlier run.
+- **Date parsing during folder-metadata reads is now pinned to invariant culture**, closing a theoretical misparse on a non-Gregorian regional setting.
+- **Cancelled rows now show a status in the copy log grid** instead of a blank cell.
+
+---
+
 ## 3.4.0 — 2026-07-23
 
 ### Added
