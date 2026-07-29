@@ -190,6 +190,18 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         // here so their paths can be folded into that same dirty set.
         var newlyCreatedEmptyFolderPaths = new List<string>();
 
+        // Ordinary (non-special, non-root) folder IDENTITIES discovered by the scan for free — see
+        // SourceFileEntry.IsFolder — captured here per top-level job (keyed by reference; CopyJob has
+        // no custom Equals, so this is exact identity) instead of being rediscovered later by a
+        // separate re-walk (Enhanced REST's old EnumerateFoldersAsync pass) or an ancestor "hopsUp"
+        // derivation from a sample descendant FILE (SPMI's old scheme). Both engines still do their
+        // own per-folder metadata+color fetch using these identities directly — what this eliminates
+        // is the extra round trip(s) each engine previously needed just to FIND the right folder item
+        // id in the first place (a full redundant tree walk for Enhanced REST; 1-3 parentReference
+        // hops plus a ProgId probe per folder for SPMI).
+        var scannedFoldersByJob = new Dictionary<CopyJob,
+            List<(string driveId, string itemId, string relativePath)>>();
+
         // Pre-seeded rows (e.g. from a "select individual files" UI flow that creates placeholder
         // rows before the copy starts) are looked up by source path once per top-level job below.
         // Built once, O(n), instead of FindResult's old per-job linear scan of the whole (and
@@ -317,6 +329,13 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                 }
                 else
                 {
+                    // Every file in the same source folder computes the IDENTICAL TargetSubFolderPath
+                    // (see ComputeTargetSubFolder) — without this cache, a 250k-file/5,000-folder job
+                    // allocates 250k separate-but-equal-content strings for a value that only has 5,000
+                    // distinct contents. Keyed by the file's directory portion of relativePath, scoped
+                    // to this top-level job (ComputeTargetSubFolder's other inputs are fixed per job).
+                    var targetSubFolderCache = new Dictionary<string, string>(StringComparer.Ordinal);
+
                     await foreach (var entry in spService.EnumerateFilesForCopyAsync(
                         job.SourceDriveId, job.SourceItemId, "", scanController, cancellationToken))
                     {
@@ -327,6 +346,19 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                         {
                             lastScanReport = DateTimeOffset.UtcNow;
                             activityLog?.Report($"Scanning source: {scannedFiles:N0} file(s) found so far...");
+                        }
+
+                        // Identity-only entry for an ordinary folder (see SourceFileEntry.IsFolder) —
+                        // never creates a grid row or copy job here; just record its (driveId, itemId)
+                        // for the folder-metadata passes further down (both engines), which still do
+                        // their own per-folder metadata+color fetch — this only saves them from having
+                        // to FIND the folder's item id themselves.
+                        if (entry.IsFolder)
+                        {
+                            if (!scannedFoldersByJob.TryGetValue(job, out var jobFolders))
+                                scannedFoldersByJob[job] = jobFolders = [];
+                            jobFolders.Add((driveId, itemId, relativePath));
+                            continue;
                         }
 
                         // Special folder (e.g. a OneNote notebook — see SourceFileEntry.IsSpecialFolder):
@@ -428,8 +460,13 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                             continue;
                         }
 
-                        var targetSubFolder = ComputeTargetSubFolder(
-                            relativePath, job.SourceName, job.IsLibrary, job.TargetSubFolderPath);
+                        var fileDirKey = System.IO.Path.GetDirectoryName(relativePath)?.Replace('\\', '/') ?? string.Empty;
+                        if (!targetSubFolderCache.TryGetValue(fileDirKey, out var targetSubFolder))
+                        {
+                            targetSubFolder = ComputeTargetSubFolder(
+                                relativePath, job.SourceName, job.IsLibrary, job.TargetSubFolderPath);
+                            targetSubFolderCache[fileDirKey] = targetSubFolder;
+                        }
                         var fileJob = new CopyJob
                         {
                             SourceDriveId                  = driveId,
@@ -472,6 +509,22 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
             activityLog?.Report($"Source scan complete: {scannedFiles:N0} file(s) found");
         await FlushPendingResultsAsync();
 
+        // Flattens scannedFoldersByJob into the SAME key shape SPMI's folder-metadata correction
+        // already keys by (TargetSubFolderPath.Trim('/') — see MigrationJobService's directFolderGroups):
+        // ComputeTargetFolderPath treats a folder's own relativePath exactly like a hypothetical file
+        // living directly inside it, which is the same computation a file job's TargetSubFolderPath
+        // already uses (ComputeTargetSubFolder) — so keys from both sources line up. Passed to
+        // MigrationJobService so it can skip its ancestor "hopsUp" derivation entirely and go straight
+        // to the folder's real item id.
+        var scannedFolderIdentities = new Dictionary<string, (string driveId, string itemId)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (folderJob, folders) in scannedFoldersByJob)
+            foreach (var (driveId, itemId, relativePath) in folders)
+            {
+                var key = ComputeTargetFolderPath(
+                    relativePath, folderJob.SourceName, folderJob.IsLibrary, folderJob.TargetSubFolderPath).Trim('/');
+                if (key.Length > 0) scannedFolderIdentities[key] = (driveId, itemId);
+            }
+
         if (copyMode == CopyMode.MigrationApi)
         {
             // Mode A: batch all files into migration jobs. When Copy Versions is off, callers pass
@@ -487,7 +540,8 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                 activityLog?.Report("⚠ Custom column values are not applied in Migration API mode — after this run, re-run in Enhanced REST mode with Copy-If-Newer to stamp custom columns");
             await migrationJobService.ExecuteAsync(allTasks, overwriteMode, migrationMaxVersions, maxParallel, cancellationToken,
                 copyCustomColumns, columnMappings, bulkFieldCache, preflightProgress, activityLog, onFilePacked,
-                reapplyFolderMetadata: preserveMetadata && reapplyFolderMetadata);
+                reapplyFolderMetadata: preserveMetadata && reapplyFolderMetadata,
+                scannedFolderIdentities: scannedFolderIdentities);
 
             // Permissions: run after the migration job completes so the target items exist.
             // We can't use Graph item IDs here (the migration API doesn't surface them), so we
@@ -571,7 +625,8 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
             if (copyPermissions && permissionService != null && spmiFolderJobs.Count > 0)
                 _ = ApplyAllFolderMetadataAsync(spmiFolderJobs, maxParallel, onMetadataDone, cancellationToken,
                     copyPermissions, permissionService, results, onFolderProgress,
-                    dirtyFolderPaths: null, applyMetadata: false, activityLog: activityLog);
+                    dirtyFolderPaths: null, applyMetadata: false, activityLog: activityLog,
+                    scannedFoldersByJob: scannedFoldersByJob);
             else
                 onMetadataDone?.Report(true);
             return;
@@ -615,7 +670,8 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
             _ = ApplyAllFolderMetadataAsync(folderJobs, maxParallel, onMetadataDone, cancellationToken,
                 copyPermissions, permissionService, results, onFolderProgress,
                 dirtyFolderPaths: (wantsFolderPermissions || reapplyFolderMetadata || dirtyFolderPaths.Count == 0) ? null : dirtyFolderPaths,
-                applyMetadata: wantsMetadataPass, activityLog: activityLog);
+                applyMetadata: wantsMetadataPass, activityLog: activityLog,
+                scannedFoldersByJob: scannedFoldersByJob);
         else
             onMetadataDone?.Report(true);
         } // end ExecuteCoreAsync
@@ -630,7 +686,8 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         IProgress<(int done, int total)>? folderProgress = null,
         HashSet<string>? dirtyFolderPaths = null,
         bool applyMetadata = true,
-        IProgress<string>? activityLog = null)
+        IProgress<string>? activityLog = null,
+        Dictionary<CopyJob, List<(string driveId, string itemId, string relativePath)>>? scannedFoldersByJob = null)
     {
         bool completed = true;
         // This pass was the one phase in the app with NO throttle protection at all: launched
@@ -647,9 +704,14 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
             int[] done  = { 0 };
             int[] total = { 0 };
             foreach (var job in folderJobs)
+            {
+                List<(string driveId, string itemId, string relativePath)>? jobFolders = null;
+                scannedFoldersByJob?.TryGetValue(job, out jobFolders);
                 await ApplyFolderMetadataRecursiveAsync(job, maxParallel, gate, ct,
                     copyPermissions, permissionService, permissionResults,
-                    done, total, folderProgress, dirtyFolderPaths, applyMetadata);
+                    done, total, folderProgress, dirtyFolderPaths, applyMetadata,
+                    jobFolders);
+            }
         }
         catch (OperationCanceledException) { completed = false; }
         catch (Exception ex)
@@ -1140,7 +1202,8 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         int[]? folderDone = null, int[]? folderTotal = null,
         IProgress<(int done, int total)>? folderProgress = null,
         HashSet<string>? dirtyFolderPaths = null,
-        bool applyMetadata = true)
+        bool applyMetadata = true,
+        List<(string driveId, string itemId, string relativePath)>? scannedFolders = null)
     {
         var prefix = string.IsNullOrEmpty(job.TargetSubFolderPath) ? "" : job.TargetSubFolderPath + "/";
 
@@ -1219,9 +1282,23 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
             folderProgress?.Report((folderDone?[0] ?? 0, folderTotal?[0] ?? 0));
         }
 
-        var subFolders = new List<(string driveId, string itemId, string relativePath)>();
-        await foreach (var item in spService.EnumerateFoldersAsync(job.SourceDriveId, job.SourceItemId, ct: ct))
-            subFolders.Add(item);
+        // Sourced from the main scan (see SourceFileEntry.IsFolder / scannedFoldersByJob), not a
+        // separate EnumerateFoldersAsync re-walk of the whole tree — that re-walk was redundant (the
+        // scan already visited every folder), serial, and had no throttle protection at all. Falls
+        // back to the old re-walk only if the scan didn't capture anything for this job (e.g. a
+        // caller that bypassed the normal scan path), so a genuinely empty/unexpected gap doesn't
+        // silently skip every subfolder's metadata.
+        List<(string driveId, string itemId, string relativePath)> subFolders;
+        if (scannedFolders != null)
+        {
+            subFolders = scannedFolders;
+        }
+        else
+        {
+            subFolders = [];
+            await foreach (var item in spService.EnumerateFoldersAsync(job.SourceDriveId, job.SourceItemId, ct: ct))
+                subFolders.Add(item);
+        }
 
         // With dirty tracking, skip subfolders that received no successful copies.
         // EnumerateFoldersAsync returns all descendants, so we filter the flat list here.

@@ -24,6 +24,13 @@ public class SharePointService
     // copies the real object), while our own scan and verification keep comparing it as a file.
     private static bool IsFolderLike(DriveItem item) => item.Folder != null || item.Package != null;
 
+    // C2 (source-scan perf): opt-in, OFF by default. When true, EnumerateFilesForCopyAsync uses
+    // EnumerateFilesForCopyViaDeltaAsync (one /delta walk instead of one Graph listing PER FOLDER)
+    // instead of the proven WalkFilesForCopyAsync path. Unverified against a live tenant — flip this
+    // only for controlled testing; do not surface it in the UI/settings until it has been. See
+    // EnumerateFilesForCopyViaDeltaAsync's header comment for the full risk/tradeoff writeup.
+    internal static bool UseDeltaScan = false;
+
     private readonly AuthService _authService;
     private GraphServiceClient? _graphClient;
     // 30-minute timeout: site copies involve large file downloads and long-running REST calls.
@@ -356,9 +363,21 @@ public class SharePointService
     // budget when the upfront metadata cache missed the file under throttling — without it a
     // multi-GB file whose metadata fetch failed was treated as size 0, bypassed the gate, and
     // 16 of them downloading concurrently exhausted process memory (observed 2026-07-18).
+    // IsFolder: a metadata-only entry for an ORDINARY (non-special) folder — emitted once per folder,
+    // regardless of whether it turns out to have children or not, so downstream folder-metadata
+    // passes (both engines) never need a second, separate per-folder fetch or walk. Never emitted for
+    // the walk's own ROOT (job.SourceItemId) — that folder is never encountered as "someone's child"
+    // by this walk, exactly like IsSpecialContainer's root exception (see
+    // IsRootFolderSpecialContainerAsync); root metadata keeps using each engine's existing separate
+    // root-only fetch. Consumers should NOT create a copy job or grid row from this entry — it exists
+    // purely to carry Created/CreatedByEmail/ModifiedByEmail data folders don't otherwise get. A
+    // folder that also turns out empty gets BOTH this entry AND its own IsEmptyFolder entry — they
+    // are complementary (one is metadata, the other drives creation/row-reporting), not alternatives.
     public readonly record struct SourceFileEntry(
         string DriveId, string ItemId, string Name, string RelativePath, DateTimeOffset? Modified,
-        long? Size = null, bool IsSpecialFolder = false, bool IsEmptyFolder = false);
+        long? Size = null, bool IsSpecialFolder = false, bool IsEmptyFolder = false,
+        bool IsFolder = false, DateTimeOffset? Created = null,
+        string? CreatedByEmail = null, string? ModifiedByEmail = null);
 
     // Concurrent replacement for the old sequential recursive walk (same channel + sibling-fan-out
     // pattern as EnumerateFilesWithMetadataAsync below). The sequential version issued ONE Graph
@@ -370,6 +389,14 @@ public class SharePointService
         AdaptiveParallelismController controller,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
+        // See UseDeltaScan's declaration — opt-in, off by default, unverified against a live tenant.
+        if (UseDeltaScan)
+        {
+            await foreach (var f in EnumerateFilesForCopyViaDeltaAsync(driveId, rootItemId, basePath, ct))
+                yield return f;
+            yield break;
+        }
+
         var channel = System.Threading.Channels.Channel.CreateUnbounded<SourceFileEntry>();
         var walkTask = Task.Run(async () =>
         {
@@ -381,6 +408,184 @@ public class SharePointService
             yield return f;
 
         await walkTask; // propagate walk exceptions (channel completion alone would swallow them)
+    }
+
+    // ── C2: delta-based source scan (opt-in — see UseDeltaScan) ────────────────────────────────
+    //
+    // WalkFilesForCopyAsync above issues one Graph /children listing PER FOLDER — cheap for a shallow
+    // tree, but on a 100k-file/5,000-folder library that's ~5,000 round trips paid purely to discover
+    // the tree shape, before any file transfer starts. /drives/{id}/items/{id}/delta returns the WHOLE
+    // subtree (files AND folders) in large pages (~1,000-2,000 items/page) regardless of how many
+    // folders that spans — the same 100k/5,000-folder library costs ~20-50 delta calls instead of
+    // ~5,000 listings, because delta's page boundary is item count, not folder boundary.
+    //
+    // The catch: /delta does NOT support $expand=listItem (confirmed by a Microsoft maintainer — it
+    // 400s with "One of the provided arguments is not acceptable"), and Document Set detection (see
+    // IsSpecialContainer) depends on listItem.contentType. This method still gets OneNote-style
+    // detection for free (the "package" facet rides along on the normal $select), but Document Sets
+    // need a SEPARATE batched pass (BatchFetchContentTypeIdsAsync) over whatever plain folders survive
+    // the package-facet filter — batched 20/call so this supplementary pass doesn't reintroduce the
+    // "1 round trip per folder" cost delta was meant to eliminate.
+    //
+    // Path reconstruction: delta returns a flat list with parentReference.Id per item, not a
+    // pre-built tree, so relative paths are resolved by walking each item's parent chain (memoized)
+    // until hitting either the scan root itself or an item absent from the fetched set (which can
+    // only be the scan root's own external parent, since delta only returns items inside the
+    // requested subtree).
+    //
+    // UNVERIFIED AGAINST A LIVE TENANT. In particular: (a) that /delta on a non-root itemId behaves as
+    // documented for an arbitrary folder (not just the drive root), (b) that an initial (no stored
+    // deltaLink) call reliably returns a complete snapshot in one paginated sweep without a `deleted`
+    // facet appearing among live items, (c) the actual round-trip count on a real large tenant. Kept
+    // off by default (UseDeltaScan) until someone runs it against one.
+    private async IAsyncEnumerable<SourceFileEntry> EnumerateFilesForCopyViaDeltaAsync(
+        string driveId, string rootItemId, string basePath,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var resolvedRootId = rootItemId == "root" ? "root" : rootItemId;
+        var allItems = new List<DriveItem>();
+
+        var page = await Graph.Drives[driveId].Items[resolvedRootId].Delta.GetAsDeltaGetResponseAsync(cfg =>
+        {
+            cfg.QueryParameters.Select = ["id", "name", "file", "folder", "package", "size",
+                "lastModifiedDateTime", "createdDateTime", "createdBy", "lastModifiedBy",
+                "parentReference", "root", "deleted"];
+        }, ct);
+
+        while (page != null)
+        {
+            allItems.AddRange(page.Value ?? []);
+            if (page.OdataNextLink == null) break;
+            ct.ThrowIfCancellationRequested();
+            page = await Graph.Drives[driveId].Items[resolvedRootId].Delta
+                .WithUrl(page.OdataNextLink).GetAsDeltaGetResponseAsync(cancellationToken: ct);
+        }
+        // page.OdataDeltaLink (present on the final page) marks the end of the initial sync — this
+        // scan is one-shot per run, so it's deliberately not persisted (see this method's header:
+        // the deltaLink-persistence half is a separate, unimplemented follow-up, not this fix).
+
+        var itemsById = new Dictionary<string, DriveItem>(StringComparer.Ordinal);
+        foreach (var item in allItems)
+        {
+            if (item.Id == null || item.Deleted != null) continue;
+            itemsById[item.Id] = item;
+        }
+
+        bool IsSelfRootEntry(DriveItem item) =>
+            item.Root != null || (rootItemId != "root" && item.Id == resolvedRootId);
+
+        // Package-facet special containers (OneNote-style) are known for free from this same fetch —
+        // no extra call. Document Sets need the supplementary contentType pass below.
+        var plainFolderCandidates = new List<(string driveId, string itemId)>();
+        var specialIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var item in itemsById.Values)
+        {
+            if (IsSelfRootEntry(item) || !IsFolderLike(item)) continue;
+            if (item.Package != null) specialIds.Add(item.Id!);
+            else plainFolderCandidates.Add((driveId, item.Id!));
+        }
+
+        if (plainFolderCandidates.Count > 0)
+        {
+            var contentTypeIds = await BatchFetchContentTypeIdsAsync(plainFolderCandidates, maxConcurrency: 6, ct: ct);
+            foreach (var (_, itemId) in plainFolderCandidates)
+            {
+                if (contentTypeIds.TryGetValue(itemId, out var ctId) && ctId != null &&
+                    ctId.StartsWith(DocumentSetContentTypeIdPrefix, StringComparison.OrdinalIgnoreCase))
+                    specialIds.Add(itemId);
+            }
+        }
+
+        // Descendants of a special container are handled by the native special-folder copy (see
+        // CopySpecialFolderAsync) — this walk must emit exactly one entry FOR the special folder
+        // itself and nothing for anything inside it, matching WalkFilesForCopyAsync's behavior (it
+        // physically never recurses into one). Delta, unlike a recursive walk, returns everything in
+        // one flat list regardless, so descendants of a special folder have to be filtered out here.
+        var childrenByParent = new Dictionary<string, List<DriveItem>>(StringComparer.Ordinal);
+        foreach (var item in itemsById.Values)
+        {
+            if (IsSelfRootEntry(item)) continue;
+            var parentId = item.ParentReference?.Id;
+            if (parentId == null) continue;
+            if (!childrenByParent.TryGetValue(parentId, out var list))
+                childrenByParent[parentId] = list = [];
+            list.Add(item);
+        }
+        var excludedIds = new HashSet<string>(StringComparer.Ordinal);
+        void ExcludeDescendants(string parentId)
+        {
+            if (!childrenByParent.TryGetValue(parentId, out var kids)) return;
+            foreach (var kid in kids)
+            {
+                if (kid.Id == null || !excludedIds.Add(kid.Id)) continue;
+                ExcludeDescendants(kid.Id);
+            }
+        }
+        foreach (var specialId in specialIds) ExcludeDescendants(specialId);
+
+        var pathCache = new Dictionary<string, string>(StringComparer.Ordinal);
+        string ResolvePath(DriveItem item)
+        {
+            if (item.Id != null && pathCache.TryGetValue(item.Id, out var cached)) return cached;
+            var parentId = item.ParentReference?.Id;
+            string path;
+            if (parentId == null || !itemsById.TryGetValue(parentId, out var parent) || IsSelfRootEntry(parent))
+                path = item.Name ?? string.Empty;
+            else
+            {
+                var parentPath = ResolvePath(parent);
+                path = string.IsNullOrEmpty(parentPath) ? (item.Name ?? string.Empty) : $"{parentPath}/{item.Name}";
+            }
+            if (item.Id != null) pathCache[item.Id] = path;
+            return path;
+        }
+        string FullRelativePath(DriveItem item)
+        {
+            var p = ResolvePath(item);
+            return string.IsNullOrEmpty(basePath) ? p : (string.IsNullOrEmpty(p) ? basePath : $"{basePath}/{p}");
+        }
+
+        foreach (var item in itemsById.Values)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (item.Id == null || item.Name == null) continue;
+            if (IsSelfRootEntry(item) || excludedIds.Contains(item.Id)) continue;
+
+            var relativePath = FullRelativePath(item);
+
+            if (IsFolderLike(item))
+            {
+                if (specialIds.Contains(item.Id))
+                {
+                    yield return new SourceFileEntry(
+                        driveId, item.Id, item.Name, relativePath, item.LastModifiedDateTime, IsSpecialFolder: true);
+                }
+                else
+                {
+                    bool hasChildren = childrenByParent.TryGetValue(item.Id, out var kids) && kids.Count > 0;
+                    if (!hasChildren)
+                    {
+                        yield return new SourceFileEntry(
+                            driveId, item.Id,
+                            relativePath.Contains('/') ? relativePath[(relativePath.LastIndexOf('/') + 1)..] : relativePath,
+                            relativePath, null, IsEmptyFolder: true);
+                    }
+                    else
+                    {
+                        yield return new SourceFileEntry(
+                            driveId, item.Id, item.Name, relativePath, item.LastModifiedDateTime,
+                            IsFolder: true, Created: item.CreatedDateTime,
+                            CreatedByEmail: GetIdentityEmail(item.CreatedBy?.User),
+                            ModifiedByEmail: GetIdentityEmail(item.LastModifiedBy?.User));
+                    }
+                }
+            }
+            else
+            {
+                yield return new SourceFileEntry(
+                    driveId, item.Id, item.Name, relativePath, item.LastModifiedDateTime, item.Size);
+            }
+        }
     }
 
     private async Task WalkFilesForCopyAsync(
@@ -421,7 +626,18 @@ public class SharePointService
                     await writer.WriteAsync(new SourceFileEntry(
                         driveId, item.Id, item.Name, childPath, item.LastModifiedDateTime, IsSpecialFolder: true), ct);
                 else
+                {
+                    // Metadata-only entry for this ordinary folder (see SourceFileEntry.IsFolder) —
+                    // emitted from the PARENT's own listing, which already has these fields for free.
+                    // Emitted unconditionally, before descending, regardless of whether the recursive
+                    // call below finds this folder empty or not.
+                    await writer.WriteAsync(new SourceFileEntry(
+                        driveId, item.Id, item.Name, childPath, item.LastModifiedDateTime,
+                        IsFolder: true, Created: item.CreatedDateTime,
+                        CreatedByEmail: GetIdentityEmail(item.CreatedBy?.User),
+                        ModifiedByEmail: GetIdentityEmail(item.LastModifiedBy?.User)), ct);
                     subfolderWalks.Add(WalkFilesForCopyAsync(driveId, item.Id, childPath, controller, writer, ct));
+                }
             }
             else
                 await writer.WriteAsync(new SourceFileEntry(
@@ -658,7 +874,14 @@ public class SharePointService
         var page = await Graph.Drives[driveId].Items[resolvedId].Children.GetAsync(cfg =>
         {
             cfg.QueryParameters.Top    = 1000;
-            cfg.QueryParameters.Select = ["id", "name", "file", "folder", "package", "size", "lastModifiedDateTime"];
+            // createdDateTime/createdBy/lastModifiedBy ride along on this SAME listing call, already
+            // paid for — this is what lets WalkFilesForCopyAsync emit a metadata-carrying entry for
+            // every ordinary folder (see SourceFileEntry.IsFolder) with ZERO extra round trips,
+            // eliminating both the separate per-folder metadata fetch this walk used to require
+            // downstream and the ancestor "hopsUp" derivation SPMI used when no file lived directly
+            // in a folder.
+            cfg.QueryParameters.Select = ["id", "name", "file", "folder", "package", "size",
+                "lastModifiedDateTime", "createdDateTime", "createdBy", "lastModifiedBy"];
             // Expand only the listItem's content type so Document Sets can be told apart from plain
             // folders without a per-folder round-trip (see IsSpecialContainer). If a tenant/library
             // doesn't return it, contentType is simply null and detection falls back to the package
@@ -978,6 +1201,118 @@ public class SharePointService
         finally { Throttled -= onThrottle; }
 
         return new Dictionary<string, DateTimeOffset?>(result);
+    }
+
+    // Supplementary pass for the delta-based scan (see EnumerateFilesForCopyViaDeltaAsync / C2): Graph's
+    // /delta does NOT support $expand=listItem (confirmed by a Microsoft maintainer — 400 "One of the
+    // provided arguments is not acceptable"), so Document Set detection via listItem.contentType (see
+    // IsSpecialContainer) can't ride along on the delta call the way it does on the per-folder /children
+    // listing. Batched here (20 folders/call, same shape as FetchModifiedDatesAsync) rather than issued
+    // one call per folder — a per-folder call here would erase delta's whole advantage, since delta's
+    // win specifically comes from replacing "1 round trip per folder" with "1 round trip per ~thousand
+    // items regardless of folder count". Only called for PLAIN folders (no package facet already seen)
+    // that survive the package-facet-based special-container filter — OneNote-style containers never
+    // reach this method at all.
+    private async Task<Dictionary<string, string?>> BatchFetchContentTypeIdsAsync(
+        IReadOnlyList<(string driveId, string itemId)> folders,
+        int maxConcurrency,
+        IProgress<int>? progress = null,
+        CancellationToken ct = default)
+    {
+        var result = new System.Collections.Concurrent.ConcurrentDictionary<string, string?>();
+        if (folders.Count == 0) return new Dictionary<string, string?>();
+
+        const int ItemsPerBatch = 20; // 1 sub-request per folder
+
+        using var gate = CreateThrottleAwareGate(maxConcurrency, Math.Min(maxConcurrency, 2));
+        void onThrottle(TimeSpan delay, int __, int ___, string? ____) => gate.StepDown(delay);
+        Throttled += onThrottle;
+
+        int lastReported = 0;
+        var reportLock = new object();
+        void ReportProgress()
+        {
+            int resolved = result.Count;
+            lock (reportLock)
+            {
+                if (resolved - lastReported < 500 && resolved != folders.Count) return;
+                lastReported = resolved;
+            }
+            progress?.Report(resolved);
+        }
+
+        async Task RunPassAsync(IReadOnlyList<(string driveId, string itemId)> toFetch)
+        {
+            await Parallel.ForEachAsync(toFetch.Chunk(ItemsPerBatch),
+                new ParallelOptions { MaxDegreeOfParallelism = maxConcurrency, CancellationToken = ct },
+                async (chunk, c) =>
+                {
+                    await gate.WaitAsync(c);
+                    try
+                    {
+                        var batch = new BatchRequestContentCollection(Graph);
+                        var ids = new string?[chunk.Length];
+                        for (int i = 0; i < chunk.Length; i++)
+                        {
+                            var (driveId, itemId) = chunk[i];
+                            var req = new HttpRequestMessage(HttpMethod.Get,
+                                $"{GraphBaseUrl}/drives/{driveId}/items/{itemId}?$select=id&$expand=listItem($select=contentType)");
+                            ids[i] = batch.AddBatchRequestStep(req);
+                        }
+
+                        BatchResponseContentCollection response;
+                        try { response = await Graph.Batch.PostAsync(batch, c); }
+                        catch (OperationCanceledException) { throw; }
+                        catch { return; } // whole batch call failed — retry rounds below cover these items
+
+                        TimeSpan? subThrottleDelay = null;
+                        for (int i = 0; i < chunk.Length; i++)
+                        {
+                            if (ids[i] == null) continue;
+                            try
+                            {
+                                using var http = await response.GetResponseByIdAsync(ids[i]!);
+                                if (!http.IsSuccessStatusCode)
+                                {
+                                    if (GetBatchSubResponseThrottleDelay(http) is { } d &&
+                                        (subThrottleDelay == null || d > subThrottleDelay))
+                                        subThrottleDelay = d;
+                                    continue;
+                                }
+                                using var doc = JsonDocument.Parse(await http.Content.ReadAsStringAsync(c));
+                                string? contentTypeId = null;
+                                if (doc.RootElement.TryGetProperty("listItem", out var li) &&
+                                    li.ValueKind == JsonValueKind.Object &&
+                                    li.TryGetProperty("contentType", out var ct2) &&
+                                    ct2.ValueKind == JsonValueKind.Object &&
+                                    ct2.TryGetProperty("id", out var idProp))
+                                    contentTypeId = idProp.GetString();
+                                result[chunk[i].itemId] = contentTypeId;
+                            }
+                            catch { /* leave absent; retried below */ }
+                        }
+                        if (subThrottleDelay is { } throttle)
+                            Throttled?.Invoke(throttle, 1, 1, "inside $batch");
+                    }
+                    finally { gate.Release(); }
+
+                    ReportProgress();
+                });
+        }
+
+        try
+        {
+            await RunPassAsync(folders);
+            for (int round = 0; round < 8; round++)
+            {
+                var missing = folders.Where(f => !result.ContainsKey(f.itemId)).ToList();
+                if (missing.Count == 0) break;
+                await RunPassAsync(missing);
+            }
+        }
+        finally { Throttled -= onThrottle; }
+
+        return new Dictionary<string, string?>(result);
     }
 
     // Fetches metadata + versions for every item ONCE, in PARALLEL, into a reusable cache the download
@@ -1484,6 +1819,52 @@ public class SharePointService
             });
 
         return new Dictionary<string, FileMetadata>(result);
+        }
+        finally { Throttled -= onThrottle; }
+    }
+
+    // Non-root counterpart to FetchFolderMetadataAsync's per-folder branch, for callers that already
+    // know each folder's real (driveId, itemId) — from the source scan (see CopyService's
+    // SourceFileEntry.IsFolder) — instead of only a sample descendant file. Skips BOTH things that
+    // made the old scheme expensive and, in one case, wrong:
+    //   • the ancestor "hopsUp" parentReference walk (1+ Graph calls per folder) needed to resolve a
+    //     folder's identity from a borrowed descendant file — not needed when the identity is already
+    //     known, and it's what let a target-side-only path segment shift the walk onto an unrelated
+    //     folder (including the target library root itself in one observed case)
+    //   • the GetFolderProgIdAsync probe (2 calls per folder) — always returns null here by
+    //     construction: a folder reaching this method came from the main scan, which diverts special
+    //     containers (the only things that ever have a ProgID) to native copy before they can produce
+    //     one of these entries
+    // What remains (metadata + color in one call via GetFileMetadataAsync) is unchanged from the old
+    // per-folder cost — same gate/backoff pattern as FetchFolderMetadataAsync.
+    public async Task<Dictionary<string, FileMetadata>> FetchFolderMetadataByIdentityAsync(
+        IReadOnlyList<(string folderKey, string driveId, string itemId)> folders,
+        int maxConcurrency,
+        IProgress<int>? progress = null,
+        CancellationToken ct = default)
+    {
+        int completed = 0;
+        var result = new System.Collections.Concurrent.ConcurrentDictionary<string, FileMetadata>();
+        if (folders.Count == 0) return new Dictionary<string, FileMetadata>();
+
+        using var gate = CreateThrottleAwareGate(maxConcurrency, Math.Min(Math.Max(1, maxConcurrency), 2));
+        void onThrottle(TimeSpan delay, int __, int ___, string? ____) => gate.StepDown(delay);
+        Throttled += onThrottle;
+        try
+        {
+            await Parallel.ForEachAsync(folders,
+                new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, maxConcurrency), CancellationToken = ct },
+                async (f, c) =>
+                {
+                    await gate.WaitAsync(c);
+                    try
+                    {
+                        result[f.folderKey] = await GetFileMetadataAsync(f.driveId, f.itemId, includeFolderColor: true);
+                    }
+                    catch { /* keep placeholder */ }
+                    finally { gate.Release(); progress?.Report(Interlocked.Increment(ref completed)); }
+                });
+            return new Dictionary<string, FileMetadata>(result);
         }
         finally { Throttled -= onThrottle; }
     }

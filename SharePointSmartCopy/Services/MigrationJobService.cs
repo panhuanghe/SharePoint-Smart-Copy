@@ -31,6 +31,14 @@ public class MigrationJobService(SharePointService spService)
     // 2026-07-19) — the gate then probes UPWARD from here under clean running and halves on any
     // upload interruption, so it self-tunes to the tenant/link instead of relying on a fixed cap.
     private const int UploadSoftStart = 4;
+    // Hard SPMI per-batch ceiling on <File> version entries (see the batching comment further down)
+    // — but it's also a hard per-FILE ceiling: one document with more versions than this can never
+    // fit in any batch under the current one-package-per-batch architecture (a single file's version
+    // history can't be split across separate migration jobs), so a file's own copied version count
+    // must never exceed it either, regardless of what the user requested. Without this, "Copy all
+    // versions" (maxVersions == 0) or a user-set cap above 250 let an outlier document form a batch
+    // that fails every import and reproduces itself identically on every retry (B11).
+    private const int MaxVersionsPerJob = 250;
 
     // In-flight content downloads, surfaced in the heartbeat so a slow large-file download reads as
     // progress instead of a silent stall (a ~1.4 GB deck took ~20 min with no visible activity,
@@ -71,9 +79,30 @@ public class MigrationJobService(SharePointService spService)
         IProgress<(int completed, int total)>? preflightProgress = null,
         IProgress<string>? activityLog = null,
         IProgress<int>? onFilePacked = null,
-        bool reapplyFolderMetadata = true)
+        bool reapplyFolderMetadata = true,
+        // Folder identities the source scan already discovered for free (see CopyService's
+        // SourceFileEntry.IsFolder / scannedFoldersByJob), keyed the same way directFolderGroups is
+        // below (TargetSubFolderPath.Trim('/')). When provided, replaces the ancestor "hopsUp"
+        // derivation entirely — no more resolving a folder's identity by walking up from a borrowed
+        // descendant file's parentReference chain, which is also what let a target-side-only path
+        // segment shift the walk onto the WRONG folder (including, in one case, the target library
+        // root itself). Null falls back to the old scheme, for any caller that bypasses the normal
+        // scan (defensive — every current caller provides it).
+        Dictionary<string, (string driveId, string itemId)>? scannedFolderIdentities = null)
     {
         if (fileTasks.Count == 0) return;
+
+        // Clamp here, once, so every downstream use of maxVersions — batching's VersionsOf AND the
+        // actual per-file download/upload clamp in DownloadFileDataAsync — agrees on the same
+        // effective ceiling (see MaxVersionsPerJob). A no-op for the common case (a user cap already
+        // at or under 250); only changes behavior for "copy all versions" (0) or a cap above 250.
+        if (maxVersions == 0 || maxVersions > MaxVersionsPerJob)
+        {
+            activityLog?.Report(maxVersions == 0
+                ? $"⚠ \"Copy all versions\" requested, but Migration API mode can copy at most {MaxVersionsPerJob:N0} versions per file — any document with more history will have its oldest versions truncated"
+                : $"⚠ Max versions ({maxVersions}) exceeds the {MaxVersionsPerJob:N0}-version-per-file ceiling Migration API mode can handle — clamping to {MaxVersionsPerJob:N0}");
+            maxVersions = MaxVersionsPerJob;
+        }
 
         int   preflightTotal   = fileTasks.Count;
         int[] preflightCounter = { 0 };
@@ -499,19 +528,11 @@ public class MigrationJobService(SharePointService spService)
                         g => (driveId: g.First().job.SourceDriveId, sampleFileItemId: g.First().job.SourceItemId),
                         StringComparer.OrdinalIgnoreCase);
 
-                // BUG FIX (2026-07-07): a folder containing ONLY subfolders — no file directly inside
-                // it — never appeared as a key above, so it silently kept MigrationPackageBuilder's
-                // hardcoded placeholder date. This surfaced as the two largest folders in a real run
-                // (114k and 5k files) showing a bogus 2000-01-01 date on the folder itself, because both
-                // organize everything into dated/categorized subfolders with nothing loose at their own
-                // top level — large, well-organized trees hit this far more often than small flat ones.
-                // Every ancestor segment of every file's path needs an entry (same expansion used for
-                // folderGuids below), not just paths that happen to hold a file directly. For an ancestor
-                // with no direct files, borrow the shallowest descendant that HAS one and walk up the
-                // extra levels via repeated parentReference hops — still ID-based, so folder/file names
-                // containing '#'/'%'/'+' are unaffected (unlike path-based Graph addressing elsewhere in
-                // this codebase, which specifically has to avoid those).
-                var folderMetaInput = new List<(string folderKey, string driveId, string sampleFileItemId, int hopsUp)>();
+                // A folder containing ONLY subfolders — no file directly inside it — never appears as
+                // a key in directFolderGroups, so without this it would silently keep
+                // MigrationPackageBuilder's hardcoded placeholder date. Every ancestor segment of
+                // every file's path needs an entry (same expansion used for folderGuids below), not
+                // just paths that happen to hold a file directly.
                 var allAncestorFolderPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var key in directFolderGroups.Keys)
                 {
@@ -519,45 +540,79 @@ public class MigrationJobService(SharePointService spService)
                     for (int i = 1; i <= segs.Length; i++)
                         allAncestorFolderPaths.Add(string.Join('/', segs[..i]));
                 }
-                foreach (var path in allAncestorFolderPaths)
+
+                Dictionary<string, FileMetadata> folderMetadata;
+                if (scannedFolderIdentities != null)
                 {
-                    if (directFolderGroups.TryGetValue(path, out var direct))
+                    // Go straight to each folder's real item id — no ancestor hop-walk, no ProgId
+                    // probe (see FetchFolderMetadataByIdentityAsync for why both are safe to skip
+                    // here). A path in allAncestorFolderPaths but absent from scannedFolderIdentities
+                    // means the scan never saw it (unexpected — every ordinary folder should have an
+                    // entry) and is simply skipped, same "keep placeholder" contract as a fetch failure.
+                    var byIdentityInput = allAncestorFolderPaths
+                        .Where(p => scannedFolderIdentities.ContainsKey(p))
+                        .Select(p => (folderKey: p, scannedFolderIdentities[p].driveId, scannedFolderIdentities[p].itemId))
+                        .ToList();
+                    if (byIdentityInput.Count > 0)
+                        activityLog?.Report($"Fetching metadata for {byIdentityInput.Count:N0} folders...");
+                    var byIdentityProgress = new Progress<int>(d =>
                     {
-                        folderMetaInput.Add((path, direct.driveId, direct.sampleFileItemId, 0));
-                        continue;
-                    }
-                    var pathDepth = path.Count(c => c == '/') + 1;
-                    var prefix    = path + "/";
-                    int bestDepth = int.MaxValue;
-                    (string driveId, string sampleFileItemId)? best = null;
-                    foreach (var (leafPath, leafInfo) in directFolderGroups)
-                    {
-                        if (!leafPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
-                        var leafDepth = leafPath.Count(c => c == '/') + 1;
-                        if (leafDepth < bestDepth) { bestDepth = leafDepth; best = leafInfo; }
-                    }
-                    // Every ancestor path was derived FROM some direct-file leaf above, so a matching
-                    // descendant always exists — best is never null here, but guard defensively anyway.
-                    if (best.HasValue)
-                        folderMetaInput.Add((path, best.Value.driveId, best.Value.sampleFileItemId, bestDepth - pathDepth));
+                        if (byIdentityInput.Count > 20 && (d % 100 == 0 || d == byIdentityInput.Count))
+                            activityLog?.Report($"Fetching folder metadata: {d:N0} / {byIdentityInput.Count:N0}");
+                    });
+                    folderMetadata = await spService.FetchFolderMetadataByIdentityAsync(
+                        byIdentityInput, maxConcurrency: 6, progress: byIdentityProgress, ct: cancellationToken);
+                    // Root is a separate concern in both schemes — same call as the old path,
+                    // just with an empty non-root list so only its dedicated root branch runs.
+                    var rootOnly = await spService.FetchFolderMetadataAsync(
+                        allGroupTasks[0].job.SourceDriveId, [], maxConcurrency: 1, ct: cancellationToken);
+                    if (rootOnly.TryGetValue(string.Empty, out var rootMeta))
+                        folderMetadata[string.Empty] = rootMeta;
                 }
-                // Previously silent — for a deep/wide folder structure this is 2+ Graph calls per
-                // distinct folder, each subject to Kiota's own throttle retries, and could run for a
-                // long time right after the metadata-analysis pass above with zero visible progress,
-                // making the app look hung. Report it the same way as that pass.
-                if (folderMetaInput.Count > 0)
-                    activityLog?.Report($"Fetching metadata for {folderMetaInput.Count:N0} folders...");
-                var folderProgress = new Progress<int>(d =>
+                else
                 {
-                    if (folderMetaInput.Count > 20 && (d % 100 == 0 || d == folderMetaInput.Count))
-                        activityLog?.Report($"Fetching folder metadata: {d:N0} / {folderMetaInput.Count:N0}");
-                });
-                var folderMetadata = await spService.FetchFolderMetadataAsync(
-                    allGroupTasks[0].job.SourceDriveId, folderMetaInput, maxConcurrency: 6,
-                    progress: folderProgress, ct: cancellationToken);
+                    // OLD SCHEME — kept only as a fallback for a caller that bypasses the normal scan
+                    // (every current caller provides scannedFolderIdentities). Resolves a folder's
+                    // identity by borrowing a descendant file's parentReference chain and walking up
+                    // "hopsUp" extra levels — still ID-based, so folder/file names containing
+                    // '#'/'%'/'+' are unaffected.
+                    var folderMetaInput = new List<(string folderKey, string driveId, string sampleFileItemId, int hopsUp)>();
+                    foreach (var path in allAncestorFolderPaths)
+                    {
+                        if (directFolderGroups.TryGetValue(path, out var direct))
+                        {
+                            folderMetaInput.Add((path, direct.driveId, direct.sampleFileItemId, 0));
+                            continue;
+                        }
+                        var pathDepth = path.Count(c => c == '/') + 1;
+                        var prefix    = path + "/";
+                        int bestDepth = int.MaxValue;
+                        (string driveId, string sampleFileItemId)? best = null;
+                        foreach (var (leafPath, leafInfo) in directFolderGroups)
+                        {
+                            if (!leafPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+                            var leafDepth = leafPath.Count(c => c == '/') + 1;
+                            if (leafDepth < bestDepth) { bestDepth = leafDepth; best = leafInfo; }
+                        }
+                        if (best.HasValue)
+                            folderMetaInput.Add((path, best.Value.driveId, best.Value.sampleFileItemId, bestDepth - pathDepth));
+                    }
+                    if (folderMetaInput.Count > 0)
+                        activityLog?.Report($"Fetching metadata for {folderMetaInput.Count:N0} folders...");
+                    var folderProgress = new Progress<int>(d =>
+                    {
+                        if (folderMetaInput.Count > 20 && (d % 100 == 0 || d == folderMetaInput.Count))
+                            activityLog?.Report($"Fetching folder metadata: {d:N0} / {folderMetaInput.Count:N0}");
+                    });
+                    folderMetadata = await spService.FetchFolderMetadataAsync(
+                        allGroupTasks[0].job.SourceDriveId, folderMetaInput, maxConcurrency: 6,
+                        progress: folderProgress, ct: cancellationToken);
+                }
                 // Surfaced so a repeat of the "silently placeholder-dated folder" symptom is visible
                 // immediately in the log instead of only being discovered by eye in SharePoint later.
-                int foldersMissingMetadata = folderMetaInput.Count - folderMetadata.Count;
+                // Same formula shape as the old scheme (folderMetaInput.Count - folderMetadata.Count,
+                // where folderMetaInput always had exactly one entry per ancestor path).
+                int foldersMissingMetadata = allAncestorFolderPaths.Count - folderMetadata.Count;
                 if (foldersMissingMetadata > 0)
                     activityLog?.Report($"⚠ {foldersMissingMetadata:N0} folder(s) could not be dated (Graph lookup failed after retries) — they will show a 2000-01-01 placeholder date instead of their real source date");
 
@@ -761,7 +816,9 @@ public class MigrationJobService(SharePointService spService)
                 // there's no per-item list-item error, so the old 120/133/200 "ceilings" (which were that
                 // threshold, not a real SP limit) no longer apply. Raising to 200 to cut the job count for
                 // 120k; verify a clean run, then try higher (250) if it holds.
-                const int MaxVersionsPerJob = 250;
+                // MaxVersionsPerJob is now a class-level constant (see its declaration) — maxVersions
+                // itself is clamped to it at the top of ExecuteAsync, so VersionsOf below can never
+                // see a per-file raw count whose clamped value exceeds this ceiling (B11).
                 const int MaxItemsPerJob    = 250;
                 // Byte budget alongside the entry budgets. This is what actually shapes batches for a
                 // large-file library, since the 250-item cap never bites when files are big. It is the
@@ -990,26 +1047,41 @@ public class MigrationJobService(SharePointService spService)
 
                         string? failReason = null;
                         string? deleteTrace = null;
-                        bool ok = await spService.PermanentlyDeleteFileAsync(
-                            targetSiteUrl, fileServerRelUrl, r => failReason = r, t => deleteTrace = t);
-                        if (ok)
+                        bool ok;
+                        try
                         {
-                            // Confirm it's ACTUALLY gone before trusting the recycle/purge HTTP status —
-                            // and if the URL still resolves, DELETE AGAIN. Observed 2026-07-02 17:09:
-                            // recycle+purge reported success on 100 conflicts yet all 100 still resolved
-                            // ("cleared 0/100"), consistent with a second row surviving at the same URL
-                            // (aborted SPMI imports leave orphaned rows alongside the list item). A second
-                            // delete pass finds no list item, so recycleObject fails over to deleteObject,
-                            // which removes rows at the AllDocs level — the one path the first pass never
-                            // took while the recycle succeeded.
-                            for (int v = 0; ; v++)
+                            ok = await spService.PermanentlyDeleteFileAsync(
+                                targetSiteUrl, fileServerRelUrl, r => failReason = r, t => deleteTrace = t);
+                            if (ok)
                             {
-                                if (await spService.GetFileUniqueIdAsync(targetSiteUrl, fileServerRelUrl) == null) break;
-                                if (v >= 2) { ok = false; failReason ??= "still resolves after delete+verify"; break; }
-                                await spService.PermanentlyDeleteFileAsync(
-                                    targetSiteUrl, fileServerRelUrl, r => failReason = r, t => deleteTrace = t);
-                                await Task.Delay(TimeSpan.FromSeconds(3 * (v + 1)), ct);
+                                // Confirm it's ACTUALLY gone before trusting the recycle/purge HTTP status —
+                                // and if the URL still resolves, DELETE AGAIN. Observed 2026-07-02 17:09:
+                                // recycle+purge reported success on 100 conflicts yet all 100 still resolved
+                                // ("cleared 0/100"), consistent with a second row surviving at the same URL
+                                // (aborted SPMI imports leave orphaned rows alongside the list item). A second
+                                // delete pass finds no list item, so recycleObject fails over to deleteObject,
+                                // which removes rows at the AllDocs level — the one path the first pass never
+                                // took while the recycle succeeded.
+                                for (int v = 0; ; v++)
+                                {
+                                    if (await spService.GetFileUniqueIdAsync(targetSiteUrl, fileServerRelUrl) == null) break;
+                                    if (v >= 2) { ok = false; failReason ??= "still resolves after delete+verify"; break; }
+                                    await spService.PermanentlyDeleteFileAsync(
+                                        targetSiteUrl, fileServerRelUrl, r => failReason = r, t => deleteTrace = t);
+                                    await Task.Delay(TimeSpan.FromSeconds(3 * (v + 1)), ct);
+                                }
                             }
+                        }
+                        catch (Exception ex) when (ex is not OperationCanceledException)
+                        {
+                            // Every sibling call in this method (PermanentlyDeleteFileAsync itself,
+                            // GetFileUniqueIdAsync) is otherwise unguarded here — an unexpected exception
+                            // (throttle retries exhausted, transient network failure) used to escape this
+                            // Parallel.ForEachAsync entirely, aborting the WHOLE retry pass for every other
+                            // conflict in the batch instead of just this one file (B7). Treat it the same
+                            // as a delete failure: this file stays blocked, everything else still gets tried.
+                            ok = false;
+                            failReason ??= ex.Message;
                         }
 
                         if (ok) { Interlocked.Increment(ref clearedCount); return; }
@@ -1070,6 +1142,16 @@ public class MigrationJobService(SharePointService spService)
                 var prepChannel = Channel.CreateBounded<PreparedBatch>(
                     new BoundedChannelOptions(MaxConcurrentImports + 1) { FullMode = BoundedChannelFullMode.Wait });
 
+                // Distinct from the caller's cancellationToken: this one is cancelled ONLY when the
+                // producer or an import worker faults, so the OTHER side's blocking channel wait
+                // (WriteAsync on a full channel, ReadAllAsync on an empty one) unblocks immediately
+                // instead of hanging forever after this method's `using` gates/budget get disposed
+                // out from under it on unwind (B7 — previously `await Task.WhenAll(importWorkers)`
+                // throwing skipped `await prepProducer` entirely, leaving it running undetected).
+                using var pipelineFaultCts = new CancellationTokenSource();
+                using var pipelineCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, pipelineFaultCts.Token);
+                var pipelineCt = pipelineCts.Token;
+
                 // Producer: prepare batches sequentially (downloads already share the global gate) and
                 // hand each off to the import workers.
                 var prepProducer = Task.Run(async () =>
@@ -1078,7 +1160,7 @@ public class MigrationJobService(SharePointService spService)
                     {
                         await Parallel.ForEachAsync(
                             Enumerable.Range(0, batches.Count),
-                            new ParallelOptions { MaxDegreeOfParallelism = MaxConcurrentPrep, CancellationToken = cancellationToken },
+                            new ParallelOptions { MaxDegreeOfParallelism = MaxConcurrentPrep, CancellationToken = pipelineCt },
                             async (idx, ct) =>
                             {
                                 var prepared = await Prep(idx);
@@ -1092,7 +1174,7 @@ public class MigrationJobService(SharePointService spService)
                 // With MaxConcurrentImports=1 this is strict sequential import (the proven path).
                 var importWorkers = Enumerable.Range(0, MaxConcurrentImports).Select(_ => Task.Run(async () =>
                 {
-                    await foreach (var prepared in prepChannel.Reader.ReadAllAsync(cancellationToken))
+                    await foreach (var prepared in prepChannel.Reader.ReadAllAsync(pipelineCt))
                     {
                         var conflicts = await SubmitAndPollBatchAsync(prepared, webId, targetSiteUrl, activityLog, cancellationToken);
                         if (conflicts.Count > 0)
@@ -1100,8 +1182,24 @@ public class MigrationJobService(SharePointService spService)
                     }
                 }, cancellationToken)).ToArray();
 
-                await Task.WhenAll(importWorkers);
-                await prepProducer;
+                var pipelineTasks = importWorkers.Append(prepProducer).ToArray();
+                try
+                {
+                    await Task.WhenAll(pipelineTasks);
+                }
+                catch
+                {
+                    // Unblock whichever side didn't fault first (see pipelineFaultCts above), then
+                    // observe every task individually so none of them becomes an unobserved-task-
+                    // exception once this method's scope disposes the gates/budget they still hold —
+                    // the real failure is rethrown below regardless of what the observation finds.
+                    pipelineFaultCts.Cancel();
+                    foreach (var t in pipelineTasks)
+                    {
+                        try { await t; } catch { /* observed; real failure rethrown below */ }
+                    }
+                    throw;
+                }
 
                 }
                 finally
@@ -1470,6 +1568,15 @@ public class MigrationJobService(SharePointService spService)
             var pipe = Channel.CreateBounded<DownloadedFile>(
                 new BoundedChannelOptions(parallelFileDownloads + 2) { FullMode = BoundedChannelFullMode.Wait });
 
+            // Linked to cancellationToken (so real user cancellation is unchanged) but ALSO cancelled
+            // if the consumer loop below throws for any other reason — otherwise producerTask can be
+            // left blocked forever on pipe.Writer.WriteAsync (channel full, nobody reading anymore)
+            // and never gets awaited, becoming an unobserved-task-exception once this batch's resources
+            // are released (B7).
+            using var batchFaultCts = new CancellationTokenSource();
+            using var batchCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, batchFaultCts.Token);
+            var batchCt = batchCts.Token;
+
             // For small batches log every file; for large ones log milestones only to avoid flooding the feed.
             bool verbosePerFile = copyingCount <= 20;
             int  milestoneStep  = Math.Max(1, copyingCount / 10);
@@ -1491,7 +1598,7 @@ public class MigrationJobService(SharePointService spService)
                     var copyingTasks = fileTasks.Where(t => t.result.Status == CopyStatus.Copying).ToList();
 
                     await Parallel.ForEachAsync(copyingTasks,
-                        new ParallelOptions { MaxDegreeOfParallelism = parallelFileDownloads, CancellationToken = cancellationToken },
+                        new ParallelOptions { MaxDegreeOfParallelism = parallelFileDownloads, CancellationToken = batchCt },
                         async (taskPair, ct) =>
                         {
                             var (job, result) = taskPair;
@@ -1650,7 +1757,9 @@ public class MigrationJobService(SharePointService spService)
             // attributed back to the exact file. Written only in this sequential consumer loop.
             var listItemMap = new Dictionary<string, CopyResult>(StringComparer.OrdinalIgnoreCase);
 
-            await foreach (var data in pipe.Reader.ReadAllAsync(cancellationToken))
+            try
+            {
+            await foreach (var data in pipe.Reader.ReadAllAsync(batchCt))
             {
                 int filesBefore = builder.Files.Count;
                 // This iteration owns the file's large slot and byte reservation (if any) until
@@ -1818,6 +1927,22 @@ public class MigrationJobService(SharePointService spService)
             }
 
             await producerTask;
+            }
+            catch
+            {
+                // The consumer loop (or the producerTask await just inside it) threw for some reason
+                // other than the per-item catches above already handling it — fault-cancel batchCt so
+                // producerTask's download loop/channel write unblocks instead of hanging, then observe
+                // it (and any uploads already queued) so nothing here becomes an unobserved-task-
+                // exception once this batch's gates/budget are released. The real failure is rethrown.
+                batchFaultCts.Cancel();
+                try { await producerTask; } catch { /* observed */ }
+                foreach (var t in uploadTasks)
+                {
+                    try { await t; } catch { /* observed; uploadTasks already self-contain their own failures */ }
+                }
+                throw;
+            }
             await Task.WhenAll(uploadTasks); // all blobs uploaded before the manifest is built
 
             // This batch's multi-hundred-MB buffers just became garbage — compact the Large Object

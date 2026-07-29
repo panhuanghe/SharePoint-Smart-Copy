@@ -68,6 +68,23 @@ public partial class CopyResult : ObservableObject
 
     [ObservableProperty] private string? _permissionDetails;
 
+    // Raised synchronously on whatever thread sets the property (often a background copy/permission
+    // worker) so a listener can maintain O(1) incremental tallies instead of rescanning the whole
+    // result set on every UI tick — see MainViewModel's SuccessCount/FailedCount/etc., which used to
+    // each run a full CopyResults.Count(predicate) every 400 ms (~1.75M predicate calls/tick at 250k
+    // rows). Listeners must only do cheap, thread-safe bookkeeping (e.g. Interlocked) here — this is
+    // NOT marshaled to the UI thread the way OnPropertyChanged below is.
+    public event Action<CopyResult, CopyStatus, CopyStatus>? StatusChanging;
+    partial void OnStatusChanging(CopyStatus oldValue, CopyStatus newValue) => StatusChanging?.Invoke(this, oldValue, newValue);
+
+    public event Action<CopyResult, CopyStatus?, CopyStatus?>? PermissionStatusChanging;
+    partial void OnPermissionStatusChanging(CopyStatus? oldValue, CopyStatus? newValue) => PermissionStatusChanging?.Invoke(this, oldValue, newValue);
+
+    // FileFailedCount counts Status==Failed OR PermissionStatus==Failed as one thing; this remembers
+    // which side of that OR last drove the count so a listener can detect the combined predicate's
+    // transition without re-deriving it from both properties independently.
+    internal bool CountedAsFileFailed;
+
     public string StatusDisplay => Status switch
     {
         CopyStatus.Pending   => "⏳ Pending",

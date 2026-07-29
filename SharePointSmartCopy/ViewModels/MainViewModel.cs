@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using System.Text;
 using System.Windows.Data;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -73,6 +74,11 @@ public partial class MainViewModel : ObservableObject
             OnPropertyChanged(nameof(LibrarySummaryCount));
             OnPropertyChanged(nameof(LibraryPreviewItems));
         };
+
+        // The field initializer `= []` on CopyResults sets the backing field directly and does not
+        // go through the generated property setter, so OnCopyResultsChanged never fires for it —
+        // subscribe here explicitly so the very first run's rows are tallied too.
+        CopyResults.CollectionChanged += OnCopyResultsCollectionChanged;
     }
 
     // ── Settings ──────────────────────────────────────────────────────────────
@@ -718,13 +724,119 @@ public partial class MainViewModel : ObservableObject
     private readonly object _copyResultsLock = new();
     [ObservableProperty] private ObservableCollection<CopyResult> _copyResults = [];
 
+    // Incremental tallies for SuccessCount/FailedCount/etc below — see CopyResult.StatusChanging.
+    // Kept as plain ints updated via Interlocked (not [ObservableProperty]): they're written from
+    // whatever thread sets a row's Status/PermissionStatus, and only ever READ from the UI thread
+    // inside UpdateProgress's periodic tick, which is what actually raises the property-changed
+    // notifications for the bound counter properties below.
+    private int _successTally, _failedTally, _skippedTally, _cancelledTally;
+    private int _fileTotalTally, _fileSuccessTally, _fileFailedTally, _fileSkippedTally, _fileCancelledTally;
+
     partial void OnCopyResultsChanged(ObservableCollection<CopyResult> value)
     {
         BindingOperations.EnableCollectionSynchronization(value, _copyResultsLock);
+        value.CollectionChanged += OnCopyResultsCollectionChanged;
         _copyResultsView = null;
         _fileResultsView = null;
         OnPropertyChanged(nameof(CopyResultsView));
         OnPropertyChanged(nameof(FileResultsView));
+    }
+
+    private void OnCopyResultsCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        switch (e.Action)
+        {
+            case NotifyCollectionChangedAction.Add:
+                if (e.NewItems != null)
+                    foreach (CopyResult row in e.NewItems) AttachRowTallies(row);
+                break;
+            case NotifyCollectionChangedAction.Remove:
+                if (e.OldItems != null)
+                    foreach (CopyResult row in e.OldItems) DetachRowTallies(row);
+                break;
+            case NotifyCollectionChangedAction.Reset:
+                _successTally = _failedTally = _skippedTally = _cancelledTally = 0;
+                _fileTotalTally = _fileSuccessTally = _fileFailedTally = _fileSkippedTally = _fileCancelledTally = 0;
+                break;
+        }
+    }
+
+    private void AttachRowTallies(CopyResult row)
+    {
+        row.StatusChanging           += OnRowStatusChanging;
+        row.PermissionStatusChanging += OnRowPermissionStatusChanging;
+        if (!row.IsPermissionResult)
+            Interlocked.Increment(ref _fileTotalTally);
+        // Reconcile against whatever Status/PermissionStatus the row already carries — an object
+        // initializer (e.g. `new CopyResult { Status = CopyStatus.Copying }`) fires the Changing hook
+        // before this subscription exists, so a non-default starting value would otherwise never get
+        // counted. Pending/null are always the true starting point since these hooks only fire on the
+        // FIRST real transition after subscribing.
+        OnRowStatusChanging(row, CopyStatus.Pending, row.Status);
+        if (row.PermissionStatus != null)
+            OnRowPermissionStatusChanging(row, null, row.PermissionStatus);
+    }
+
+    private void DetachRowTallies(CopyResult row)
+    {
+        row.StatusChanging           -= OnRowStatusChanging;
+        row.PermissionStatusChanging -= OnRowPermissionStatusChanging;
+        if (!row.IsPermissionResult)
+            Interlocked.Decrement(ref _fileTotalTally);
+        OnRowStatusChanging(row, row.Status, CopyStatus.Pending);
+        if (row.PermissionStatus != null)
+            OnRowPermissionStatusChanging(row, row.PermissionStatus, null);
+    }
+
+    private void OnRowStatusChanging(CopyResult row, CopyStatus oldStatus, CopyStatus newStatus)
+    {
+        AdjustStatusTally(oldStatus, -1);
+        AdjustStatusTally(newStatus, +1);
+        if (!row.IsPermissionResult)
+        {
+            AdjustFileStatusTally(oldStatus, -1);
+            AdjustFileStatusTally(newStatus, +1);
+            UpdateFileFailedTally(row, newStatus, row.PermissionStatus);
+        }
+    }
+
+    private void OnRowPermissionStatusChanging(CopyResult row, CopyStatus? oldValue, CopyStatus? newValue)
+    {
+        if (!row.IsPermissionResult)
+            UpdateFileFailedTally(row, row.Status, newValue);
+    }
+
+    // FileFailedCount is Status==Failed OR PermissionStatus==Failed — tracked as one combined flag
+    // per row (CopyResult.CountedAsFileFailed) so a file that fails on both sides, or recovers on
+    // one, is never double-counted or left stuck.
+    private void UpdateFileFailedTally(CopyResult row, CopyStatus status, CopyStatus? permissionStatus)
+    {
+        bool isFailedNow = status == CopyStatus.Failed || permissionStatus == CopyStatus.Failed;
+        if (isFailedNow == row.CountedAsFileFailed) return;
+        Interlocked.Add(ref _fileFailedTally, isFailedNow ? 1 : -1);
+        row.CountedAsFileFailed = isFailedNow;
+    }
+
+    private void AdjustStatusTally(CopyStatus status, int delta)
+    {
+        switch (status)
+        {
+            case CopyStatus.Success:   Interlocked.Add(ref _successTally, delta);   break;
+            case CopyStatus.Failed:    Interlocked.Add(ref _failedTally, delta);    break;
+            case CopyStatus.Skipped:   Interlocked.Add(ref _skippedTally, delta);   break;
+            case CopyStatus.Cancelled: Interlocked.Add(ref _cancelledTally, delta); break;
+        }
+    }
+
+    private void AdjustFileStatusTally(CopyStatus status, int delta)
+    {
+        switch (status)
+        {
+            case CopyStatus.Success:   Interlocked.Add(ref _fileSuccessTally, delta);   break;
+            case CopyStatus.Skipped:   Interlocked.Add(ref _fileSkippedTally, delta);   break;
+            case CopyStatus.Cancelled: Interlocked.Add(ref _fileCancelledTally, delta); break;
+            // Failed is handled by UpdateFileFailedTally's combined predicate, not here.
+        }
     }
 
     // ── Result filter (All / Failed / Skipped chips above the log grids) ──────
@@ -962,19 +1074,22 @@ public partial class MainViewModel : ObservableObject
     private DateTimeOffset? _metadataRateAnchorTime;
     private int             _metadataRateAnchorDone;
 
-    public int SuccessCount   => CopyResults.Count(r => r.Status == CopyStatus.Success);
-    public int FailedCount    => CopyResults.Count(r => r.Status == CopyStatus.Failed);
-    public int SkippedCount   => CopyResults.Count(r => r.Status == CopyStatus.Skipped);
+    // These used to each run a full CopyResults.Count(predicate) scan — at 250k rows, six such scans
+    // every 400ms UI tick (~1.75M predicate calls/tick). Now backed by tallies maintained incrementally
+    // as each row's Status/PermissionStatus changes — see AttachRowTallies/OnRowStatusChanging.
+    public int SuccessCount   => _successTally;
+    public int FailedCount    => _failedTally;
+    public int SkippedCount   => _skippedTally;
     // Never actually attempted — the run was cancelled or the app closed while these were still
     // Copying. Kept separate from FailedCount so an interrupted run's summary doesn't read as a
     // mass failure (see CopyStatus.Cancelled).
-    public int CancelledCount => CopyResults.Count(r => r.Status == CopyStatus.Cancelled);
+    public int CancelledCount => _cancelledTally;
 
-    public int FileTotalCount   => CopyResults.Count(r => !r.IsPermissionResult);
-    public int FileSuccessCount => CopyResults.Count(r => !r.IsPermissionResult && r.Status == CopyStatus.Success);
-    public int FileFailedCount  => CopyResults.Count(r => !r.IsPermissionResult && (r.Status == CopyStatus.Failed || r.PermissionStatus == CopyStatus.Failed));
-    public int FileSkippedCount => CopyResults.Count(r => !r.IsPermissionResult && r.Status == CopyStatus.Skipped);
-    public int FileCancelledCount => CopyResults.Count(r => !r.IsPermissionResult && r.Status == CopyStatus.Cancelled);
+    public int FileTotalCount     => _fileTotalTally;
+    public int FileSuccessCount   => _fileSuccessTally;
+    public int FileFailedCount    => _fileFailedTally;
+    public int FileSkippedCount   => _fileSkippedTally;
+    public int FileCancelledCount => _fileCancelledTally;
 
     public double PermColumnWidth        => CopyPermissions ? 100 : 0;
     public double PermDetailsColumnWidth => CopyPermissions ? 200 : 0;
@@ -1510,6 +1625,40 @@ public partial class MainViewModel : ObservableObject
         progressTimer.Tick += (_, _) => UpdateProgress();
         progressTimer.Start();
 
+        // Library/Site scope can copy content into MULTIPLE libraries in sequence below, each via its
+        // own _copyService.ExecuteAsync call — and each of those launches its own detached (fire-and-
+        // forget) folder-metadata pass that outlives the ExecuteAsync call itself. This method used to
+        // pass no onMetadataDone at all, so IsUpdatingMetadata never went true here: the run was
+        // declared complete (IsReadyForReport/CanGoNext gate open) and the app could be closed while
+        // folder dates/authors/permissions were still being written in the background, and a Back→Next
+        // re-entry could dispose the still-running pass's CancellationTokenSource out from under it
+        // (B6). pendingMetadataPasses starts at 1 as a scheduling sentinel — released in the outer
+        // `finally` below — so IsUpdatingMetadata can't flip back to false mid-loop just because one
+        // library's pass happened to finish before the next library's copy even starts.
+        _metadataStartTime      = DateTimeOffset.Now;
+        IsMetadataCancelled     = false;
+        IsUpdatingMetadata      = false;
+        int  pendingMetadataPasses = 1;
+        bool anyMetadataCancelled  = false;
+        void OnOneMetadataPassDone(bool completed)
+        {
+            if (!completed) anyMetadataCancelled = true;
+            if (Interlocked.Decrement(ref pendingMetadataPasses) == 0)
+            {
+                if (anyMetadataCancelled) IsMetadataCancelled = true;
+                else MetadataElapsedTime = FormatDuration(DateTimeOffset.Now - _metadataStartTime);
+                MetadataEta        = string.Empty;
+                IsUpdatingMetadata = false;
+            }
+        }
+        IProgress<bool>? MakeMetadataProgress()
+        {
+            if (!CopyLibraryContent) return null;
+            IsUpdatingMetadata = true;
+            Interlocked.Increment(ref pendingMetadataPasses);
+            return new Progress<bool>(OnOneMetadataPassDone);
+        }
+
         try
         {
             // Pre-warm permission cache once before any copy loops.
@@ -1692,6 +1841,7 @@ public partial class MainViewModel : ObservableObject
                                 fileJobs, CopyResults,
                                 OverwriteMode, CopyVersions, MaxParallelCopies, versionLimit,
                                 CopyMode, _copyCts.Token,
+                                onMetadataDone: MakeMetadataProgress(),
                                 copyCustomColumns: EffectiveCopyCustomColumns,
                                 columnMappings: [.. ColumnMappings],
                                 bulkFieldCache: _bulkFieldCache,
@@ -1779,6 +1929,7 @@ public partial class MainViewModel : ObservableObject
                                 fileJobs, CopyResults,
                                 OverwriteMode, CopyVersions, MaxParallelCopies, versionLimit,
                                 CopyMode, _copyCts.Token,
+                                onMetadataDone: MakeMetadataProgress(),
                                 copyCustomColumns: EffectiveCopyCustomColumns,
                                 columnMappings: [.. ColumnMappings],
                                 bulkFieldCache: _bulkFieldCache,
@@ -2013,6 +2164,7 @@ public partial class MainViewModel : ObservableObject
                                 maxVersions: 0,
                                 CopyMode.EnhancedRest,
                                 _copyCts.Token,
+                                onMetadataDone: MakeMetadataProgress(),
                                 copyPages: true,
                                 remapPageWebPartUrls: RemapPageWebPartUrls,
                                 preserveMetadata: PreserveMetadata,
@@ -2159,6 +2311,15 @@ public partial class MainViewModel : ObservableObject
         catch (Exception ex)              { StatusMessage = $"Library copy error: {ex.Message}"; }
         finally
         {
+            // Release the scheduling sentinel (see its declaration above) now that every
+            // MakeMetadataProgress() call this run will ever make has already happened — on any exit
+            // path (success, cancellation, or exception). If no library/page copy ever ran, this is
+            // the ONLY decrement and IsUpdatingMetadata (never set true) stays false, unchanged from
+            // before. If at least one detached folder-metadata pass is still running, this drops the
+            // count without zeroing it, so IsUpdatingMetadata correctly stays true until that pass's
+            // own onMetadataDone callback brings the count the rest of the way to zero.
+            OnOneMetadataPassDone(true);
+
             _copyEndTime   = DateTimeOffset.Now;
             progressTimer.Stop();
             IsCopying      = false;
@@ -2302,12 +2463,11 @@ public partial class MainViewModel : ObservableObject
 
     private void UpdateProgress()
     {
-        int done, total;
-        lock (_copyResultsLock)
-        {
-            done  = CopyResults.Count(r => r.Status is CopyStatus.Success or CopyStatus.Failed or CopyStatus.Skipped);
-            total = CopyResults.Count;
-        }
+        // done/total used to be a full CopyResults.Count(predicate) scan every tick — see the
+        // SuccessCount/etc tallies above, which this reuses (Cancelled deliberately excluded, same
+        // as before: a cancelled-but-never-attempted row shouldn't count as "done").
+        int done  = _successTally + _failedTally + _skippedTally;
+        int total = CopyResults.Count;
         CompletedCount = done;
         TotalCount     = total;
         TotalProgress  = TotalCount > 0 ? done * 100.0 / TotalCount : 0;
