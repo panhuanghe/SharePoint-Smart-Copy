@@ -78,7 +78,7 @@ public class MigrationJobService(SharePointService spService)
         Dictionary<string, Dictionary<string, object?>>? bulkFieldCache = null,
         IProgress<(int completed, int total)>? preflightProgress = null,
         IProgress<string>? activityLog = null,
-        IProgress<int>? onFilePacked = null,
+        IProgress<long>? onFilePacked = null,
         bool reapplyFolderMetadata = true,
         // Folder identities the source scan already discovered for free (see CopyService's
         // SourceFileEntry.IsFolder / scannedFoldersByJob), keyed the same way directFolderGroups is
@@ -1328,7 +1328,7 @@ public class MigrationJobService(SharePointService spService)
             string, Dictionary<string, (string ItemId, DateTimeOffset? Modified)>>? prebuiltExistingByFolder = null,
         string batchLabel = "",
         IProgress<string>? activityLog = null,
-        IProgress<int>? onFilePacked = null,
+        IProgress<long>? onFilePacked = null,
         AdaptiveParallelismController? downloadController = null,
         SemaphoreSlim? largeFileGate = null,
         AdaptiveParallelismController? uploadController = null,
@@ -1871,7 +1871,7 @@ public class MigrationJobService(SharePointService spService)
                                 version.EncryptedContent = null;
                             }
                             dataResult.VersionsCopied = versCount;
-                            onFilePacked?.Report(1);
+                            onFilePacked?.Report(data.Job.SourceSize ?? 0);
                             int n = Interlocked.Increment(ref packedInBatch);
                             if (!verbosePerFile && (n == 1 || n % milestoneStep == 0 || n == copyingCount))
                                 activityLog?.Report($"{pfx}{n:N0} / {copyingCount:N0} files packaged");

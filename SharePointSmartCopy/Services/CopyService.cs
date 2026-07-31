@@ -98,7 +98,7 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         Dictionary<string, bool>? permissionFlags = null,
         IProgress<(int, int)>? preflightProgress = null,
         IProgress<string>? activityLog = null,
-        IProgress<int>? onFilePacked = null,
+        IProgress<long>? onFilePacked = null,
         IProgress<(int done, int total)>? onFolderProgress = null,
         bool reapplyFolderMetadata = true)
     {
@@ -518,12 +518,29 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         // to the folder's real item id.
         var scannedFolderIdentities = new Dictionary<string, (string driveId, string itemId)>(StringComparer.OrdinalIgnoreCase);
         foreach (var (folderJob, folders) in scannedFoldersByJob)
+        {
+            // WalkFilesForCopyAsync only emits an IsFolder entry for folders it discovers as
+            // CHILDREN of something else — the folder it was actually asked to walk (the job's own
+            // top-level folder) never appears in `folders` at all. Without this, that one folder is
+            // absent from scannedFolderIdentities, so MigrationJobService can never fetch its real
+            // date/author and it falls back to the manifest's 2000-01-01 placeholder (renders as
+            // "Dec 31, 1999" locally) — even though every descendant folder gets its real metadata.
+            // Not needed for a library job: the library root is a separate concern, keyed by ""
+            // and fetched directly in MigrationJobService.
+            if (!folderJob.IsLibrary)
+            {
+                var ownKey = ComputeTargetFolderPath(
+                    "", folderJob.SourceName, folderJob.IsLibrary, folderJob.TargetSubFolderPath).Trim('/');
+                if (ownKey.Length > 0)
+                    scannedFolderIdentities[ownKey] = (folderJob.SourceDriveId, folderJob.SourceItemId);
+            }
             foreach (var (driveId, itemId, relativePath) in folders)
             {
                 var key = ComputeTargetFolderPath(
                     relativePath, folderJob.SourceName, folderJob.IsLibrary, folderJob.TargetSubFolderPath).Trim('/');
                 if (key.Length > 0) scannedFolderIdentities[key] = (driveId, itemId);
             }
+        }
 
         if (copyMode == CopyMode.MigrationApi)
         {

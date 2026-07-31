@@ -732,6 +732,12 @@ public partial class MainViewModel : ObservableObject
     private int _successTally, _failedTally, _skippedTally, _cancelledTally;
     private int _fileTotalTally, _fileSuccessTally, _fileFailedTally, _fileSkippedTally, _fileCancelledTally;
 
+    // Byte-weighted counterparts of the tallies above, for ETA — see UpdateProgress. Kept alongside
+    // the item counts (not replacing them) because several flows (library/site copy, permissions)
+    // create CopyResult rows with no meaningful SourceSize; ETA falls back to item-count for those.
+    private long _bytesTotalTally, _bytesDoneTally, _packedBytesTally;
+    private int  _bytesMissingCount;
+
     partial void OnCopyResultsChanged(ObservableCollection<CopyResult> value)
     {
         BindingOperations.EnableCollectionSynchronization(value, _copyResultsLock);
@@ -757,6 +763,8 @@ public partial class MainViewModel : ObservableObject
             case NotifyCollectionChangedAction.Reset:
                 _successTally = _failedTally = _skippedTally = _cancelledTally = 0;
                 _fileTotalTally = _fileSuccessTally = _fileFailedTally = _fileSkippedTally = _fileCancelledTally = 0;
+                _bytesTotalTally = _bytesDoneTally = 0;
+                _bytesMissingCount = 0;
                 break;
         }
     }
@@ -767,6 +775,10 @@ public partial class MainViewModel : ObservableObject
         row.PermissionStatusChanging += OnRowPermissionStatusChanging;
         if (!row.IsPermissionResult)
             Interlocked.Increment(ref _fileTotalTally);
+        if (row.SourceSize is long size)
+            Interlocked.Add(ref _bytesTotalTally, size);
+        else
+            Interlocked.Increment(ref _bytesMissingCount);
         // Reconcile against whatever Status/PermissionStatus the row already carries — an object
         // initializer (e.g. `new CopyResult { Status = CopyStatus.Copying }`) fires the Changing hook
         // before this subscription exists, so a non-default starting value would otherwise never get
@@ -783,6 +795,10 @@ public partial class MainViewModel : ObservableObject
         row.PermissionStatusChanging -= OnRowPermissionStatusChanging;
         if (!row.IsPermissionResult)
             Interlocked.Decrement(ref _fileTotalTally);
+        if (row.SourceSize is long size)
+            Interlocked.Add(ref _bytesTotalTally, -size);
+        else
+            Interlocked.Decrement(ref _bytesMissingCount);
         OnRowStatusChanging(row, row.Status, CopyStatus.Pending);
         if (row.PermissionStatus != null)
             OnRowPermissionStatusChanging(row, row.PermissionStatus, null);
@@ -792,6 +808,7 @@ public partial class MainViewModel : ObservableObject
     {
         AdjustStatusTally(oldStatus, -1);
         AdjustStatusTally(newStatus, +1);
+        AdjustBytesDoneTally(oldStatus, newStatus, row.SourceSize ?? 0);
         if (!row.IsPermissionResult)
         {
             AdjustFileStatusTally(oldStatus, -1);
@@ -826,6 +843,19 @@ public partial class MainViewModel : ObservableObject
             case CopyStatus.Skipped:   Interlocked.Add(ref _skippedTally, delta);   break;
             case CopyStatus.Cancelled: Interlocked.Add(ref _cancelledTally, delta); break;
         }
+    }
+
+    // Mirrors the done/total split used for ETA (UpdateProgress: done = success+failed+skipped,
+    // deliberately excluding Cancelled — see CopyStatus.Cancelled).
+    private static bool CountsTowardEtaDone(CopyStatus status) =>
+        status is CopyStatus.Success or CopyStatus.Failed or CopyStatus.Skipped;
+
+    private void AdjustBytesDoneTally(CopyStatus oldStatus, CopyStatus newStatus, long size)
+    {
+        bool wasDone = CountsTowardEtaDone(oldStatus);
+        bool isDone  = CountsTowardEtaDone(newStatus);
+        if (wasDone == isDone) return;
+        Interlocked.Add(ref _bytesDoneTally, isDone ? size : -size);
     }
 
     private void AdjustFileStatusTally(CopyStatus status, int delta)
@@ -1057,19 +1087,36 @@ public partial class MainViewModel : ObservableObject
         {
             _etaStartTime = DateTimeOffset.Now;
             lock (_copyResultsLock)
-                _etaStartDone = CopyResults.Count(r => r.Status is CopyStatus.Success or CopyStatus.Failed or CopyStatus.Skipped);
+            {
+                int totalNow = CopyResults.Count;
+                _etaStartDone = ShouldUseBytesEta(totalNow)
+                    ? _bytesDoneTally
+                    : CopyResults.Count(r => r.Status is CopyStatus.Success or CopyStatus.Failed or CopyStatus.Skipped);
+            }
         }
     }
 
     partial void OnPreflightTotalChanged(int value) => OnPropertyChanged(nameof(IsPreflightInProgress));
 
+    // Bytes-weighted ETA whenever we know most of the file sizes (see UpdateProgress) — shared so
+    // the preflight-completion anchor above and the per-tick calculation agree on which unit is in use.
+    private bool ShouldUseBytesEta(int total) =>
+        total > 0 && _bytesTotalTally > 0 && _bytesMissingCount <= total / 10;
+
     private bool            _hasFolderJobs;
     private DateTimeOffset  _copyStartTime;
     private DateTimeOffset? _copyEndTime;
     private DateTimeOffset? _etaStartTime;
-    private int             _etaStartDone;
+    private long            _etaStartDone;
     private DateTimeOffset? _packStartTime;
-    private int             _packStartDone;
+    private long            _packStartDone;
+
+    // Recent-throughput samples for ETA calculation — a fixed lookback window rather than a
+    // full-run average, so a slow start (cold start, throttling, a large first file) doesn't
+    // drag the estimate down for the rest of the job and then snap to reality all at once.
+    private static readonly TimeSpan EtaWindow = TimeSpan.FromSeconds(20);
+    private readonly Queue<(DateTimeOffset Time, long Done)> _etaSamples = new();
+    private readonly Queue<(DateTimeOffset Time, long Done)> _packSamples = new();
     private DateTimeOffset  _metadataStartTime;
     private DateTimeOffset? _metadataRateAnchorTime;
     private int             _metadataRateAnchorDone;
@@ -1122,7 +1169,8 @@ public partial class MainViewModel : ObservableObject
             {
                 FileName   = job.SourceName,
                 SourcePath = job.SourceDisplayPath,
-                TargetPath = job.TargetDisplayPath
+                TargetPath = job.TargetDisplayPath,
+                SourceSize = job.SourceSize
             });
         }
 
@@ -1132,11 +1180,14 @@ public partial class MainViewModel : ObservableObject
         _etaStartDone = 0;
         _packStartTime = null;
         _packStartDone = 0;
+        _etaSamples.Clear();
+        _packSamples.Clear();
         TotalCount    = CopyJobs.Count;
 
         PreflightChecked = 0;
         PreflightTotal   = 0;
         PackedCount      = 0;
+        _packedBytesTally = 0;
         _activityLines.Clear();
         ActivityText = "";
         StartActivityLogFile();
@@ -1167,9 +1218,10 @@ public partial class MainViewModel : ObservableObject
             PreflightChecked = p.done;
         });
         var onActivity   = new Progress<string>(PushActivity);
-        var onFilePacked = new Progress<int>(_ =>
+        var onFilePacked = new Progress<long>(size =>
         {
             PackedCount++;
+            Interlocked.Add(ref _packedBytesTally, size);
             OnPropertyChanged(nameof(IsPackingInProgress));
         });
 
@@ -2461,6 +2513,59 @@ public partial class MainViewModel : ObservableObject
     }
 
 
+    // Estimates remaining time from a recent-window rate, falling back to the full-run average
+    // since `anchorTime` when the window hasn't seen any progress yet (e.g. one huge file has been
+    // in flight for the whole window) — so the ETA stays visible instead of blanking out between
+    // infrequent completions. `samples` holds (time, cumulative-done) points, trimmed to EtaWindow.
+    //
+    // Uploads ramp up gradually — the adaptive concurrency controller (see AdaptiveParallelismController)
+    // deliberately starts with few parallel PUTs and widens over time, so throughput in the first
+    // stretch of a run is well below steady state. A rate measured during that ramp-up and projected
+    // across the whole job used to read "3 hours" for what was actually a 20-30 minute job. Below,
+    // EtaMinConfidenceSeconds/Fraction gate the estimate off entirely (caller shows "Calculating…")
+    // until enough of the job has actually been observed to be past the ramp-up, rather than trusting
+    // whatever rate the first few seconds happen to produce.
+    private const double EtaMinConfidenceSeconds = 15;
+    private const double EtaMinConfidenceFraction = 0.02;
+
+    private static string? ComputeRemaining(
+        long doneUnits, long totalUnits, DateTimeOffset now,
+        DateTimeOffset anchorTime, long anchorDoneUnits,
+        Queue<(DateTimeOffset Time, long Done)> samples)
+    {
+        samples.Enqueue((now, doneUnits));
+        while (samples.Count > 1 && now - samples.Peek().Time > EtaWindow)
+            samples.Dequeue();
+
+        var (windowStart, windowDone) = samples.Peek();
+        var windowElapsed  = (now - windowStart).TotalSeconds;
+        var windowProgress = doneUnits - windowDone;
+
+        double elapsedSecs;
+        long   progressUnits;
+        if (windowProgress > 0 && windowElapsed >= 5)
+        {
+            elapsedSecs   = windowElapsed;
+            progressUnits = windowProgress;
+        }
+        else
+        {
+            elapsedSecs   = (now - anchorTime).TotalSeconds;
+            progressUnits = doneUnits - anchorDoneUnits;
+        }
+
+        if (progressUnits <= 0 || elapsedSecs < EtaMinConfidenceSeconds) return null;
+
+        // Require a real slice of the job to be done — not just a handful of files that may still
+        // be inside the concurrency ramp-up — before trusting the extrapolation.
+        var sinceAnchor = doneUnits - anchorDoneUnits;
+        if (totalUnits > 0 && sinceAnchor < Math.Max(1, (long)(totalUnits * EtaMinConfidenceFraction)))
+            return null;
+
+        var remainingSecs = (totalUnits - doneUnits) * elapsedSecs / progressUnits;
+        return remainingSecs >= 2 ? FormatDuration(TimeSpan.FromSeconds(remainingSecs)) : null;
+    }
+
     private void UpdateProgress()
     {
         // done/total used to be a full CopyResults.Count(predicate) scan every tick — see the
@@ -2475,29 +2580,33 @@ public partial class MainViewModel : ObservableObject
         var elapsed = (_copyEndTime ?? DateTimeOffset.Now) - _copyStartTime;
         ElapsedTime = FormatDuration(elapsed);
 
+        // Weight the ETA by bytes instead of item count whenever we know most of the sizes — a
+        // handful of huge files left after a burst of small ones otherwise reads as "almost done"
+        // right up until those huge files start, which is what made estimates swing wildly. Falls
+        // back to plain item count for flows that don't carry SourceSize (library/site copy,
+        // permission-only rows) or when too many sizes are unknown to trust the byte total.
+        bool useBytes = ShouldUseBytesEta(total);
+        long totalUnits = useBytes ? _bytesTotalTally : total;
+        long doneUnits  = useBytes ? _bytesDoneTally  : done;
+        long packedUnits = useBytes ? _packedBytesTally : PackedCount;
+
+        var now = DateTimeOffset.Now;
+
         // Packaging ETA — rate-based estimate for the download+encrypt+upload phase.
         // Anchors when the first file is packed; waits 5 s for a stable rate before showing.
+        // Computed once per tick (not per consumer) since it enqueues into _packSamples — calling
+        // it twice in the same tick would double-enqueue the same sample.
         var packed = PackedCount;
+        string? packRemaining = null;
         if (packed > 0 && packed < total && _copyEndTime == null)
         {
             if (_packStartTime == null)
             {
-                _packStartTime = DateTimeOffset.Now;
-                _packStartDone = packed;
+                _packStartTime = now;
+                _packStartDone = packedUnits;
             }
-            var packElapsed = (DateTimeOffset.Now - _packStartTime.Value).TotalSeconds;
-            var packDone    = packed - _packStartDone;
-            if (packDone > 0 && packElapsed >= 5)
-            {
-                var remainingSecs = (total - packed) * packElapsed / packDone;
-                PackagedEstimatedTimeRemaining = remainingSecs >= 2
-                    ? $" · ~{FormatDuration(TimeSpan.FromSeconds(remainingSecs))} remaining"
-                    : string.Empty;
-            }
-            else
-            {
-                PackagedEstimatedTimeRemaining = string.Empty;
-            }
+            packRemaining = ComputeRemaining(packedUnits, totalUnits, now, _packStartTime.Value, _packStartDone, _packSamples);
+            PackagedEstimatedTimeRemaining = packRemaining != null ? $" · ~{packRemaining} remaining" : " · Calculating…";
         }
         else
         {
@@ -2513,40 +2622,16 @@ public partial class MainViewModel : ObservableObject
             // Anchor the completion clock the first time files start finishing.
             if (_etaStartTime == null)
             {
-                _etaStartTime = DateTimeOffset.Now;
-                _etaStartDone = done;
+                _etaStartTime = now;
+                _etaStartDone = doneUnits;
             }
-            var etaElapsed = (DateTimeOffset.Now - _etaStartTime.Value).TotalSeconds;
-            var etaDone    = done - _etaStartDone;
-            if (etaDone > 0 && etaElapsed >= 5)
-            {
-                var remainingSecs = (total - done) * etaElapsed / etaDone;
-                EstimatedTimeRemaining = remainingSecs >= 2
-                    ? $" · ~{FormatDuration(TimeSpan.FromSeconds(remainingSecs))} remaining"
-                    : string.Empty;
-            }
-            else
-            {
-                EstimatedTimeRemaining = string.Empty;
-            }
+            var remaining = ComputeRemaining(doneUnits, totalUnits, now, _etaStartTime.Value, _etaStartDone, _etaSamples);
+            EstimatedTimeRemaining = remaining != null ? $" · ~{remaining} remaining" : " · Calculating…";
         }
         else if (done == 0 && packed > 0 && packed < total && _copyEndTime == null)
         {
-            // Packaging phase — reuse the packaging ETA with a clearer label.
-            var packElapsed2 = _packStartTime == null ? 0
-                : (DateTimeOffset.Now - _packStartTime.Value).TotalSeconds;
-            var packDone2 = packed - _packStartDone;
-            if (packDone2 > 0 && packElapsed2 >= 5)
-            {
-                var remainingSecs = (total - packed) * packElapsed2 / packDone2;
-                EstimatedTimeRemaining = remainingSecs >= 2
-                    ? $" · ~{FormatDuration(TimeSpan.FromSeconds(remainingSecs))} to package"
-                    : string.Empty;
-            }
-            else
-            {
-                EstimatedTimeRemaining = string.Empty;
-            }
+            // Packaging phase — reuse the packaging ETA computed above with a clearer label.
+            EstimatedTimeRemaining = packRemaining != null ? $" · ~{packRemaining} to package" : " · Calculating…";
         }
         else
         {

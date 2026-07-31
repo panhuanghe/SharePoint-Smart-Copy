@@ -51,6 +51,9 @@ public partial class CopyResult : ObservableObject
     [ObservableProperty] private string _fileName = string.Empty;
     [ObservableProperty] private string _sourcePath = string.Empty;
     [ObservableProperty] private string _targetPath = string.Empty;
+    // Captured from CopyJob.SourceSize at creation (byte-accurate ETA needs it) — null for rows
+    // that don't represent a single sized file (permission-only rows, library/list metadata rows).
+    public long? SourceSize { get; init; }
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(StatusDisplay))]
     [NotifyPropertyChangedFor(nameof(StatusColor))]
