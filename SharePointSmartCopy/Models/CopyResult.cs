@@ -53,7 +53,18 @@ public partial class CopyResult : ObservableObject
     [ObservableProperty] private string _targetPath = string.Empty;
     // Captured from CopyJob.SourceSize at creation (byte-accurate ETA needs it) — null for rows
     // that don't represent a single sized file (permission-only rows, library/list metadata rows).
+    // Always the CURRENT version's size only, even when version history is copied — ETA pacing
+    // needs a size known up front, and every version's size isn't known until the copy itself
+    // fetches the version list.
     public long? SourceSize { get; init; }
+
+    // Sum of every version's byte size actually copied for this file, set by CopyService /
+    // MigrationJobService once the version-replay loop finishes (before Status flips to Success) —
+    // null when version copying isn't in play (single-version copy, permission-only rows), in which
+    // case SourceSize is the whole story. Used for the post-copy "Total Size" figures (Step 5 tile,
+    // History) so a run with version history reflects the bytes actually transferred rather than
+    // just the current version — see MainViewModel's _bytesFinalTally.
+    public long? VersionsBytesTotal { get; set; }
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(StatusDisplay))]
     [NotifyPropertyChangedFor(nameof(StatusColor))]

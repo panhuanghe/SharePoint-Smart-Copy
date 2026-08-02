@@ -73,6 +73,7 @@ public partial class MainViewModel : ObservableObject
         {
             OnPropertyChanged(nameof(LibrarySummaryCount));
             OnPropertyChanged(nameof(LibraryPreviewItems));
+            OnPropertyChanged(nameof(CopyPreviewTotalSizeDisplay));
         };
 
         // The field initializer `= []` on CopyResults sets the backing field directly and does not
@@ -584,6 +585,24 @@ public partial class MainViewModel : ObservableObject
         .SelectMany(l => l.Children)
         .Count(c => c.Type == NodeType.ListItem && c.IsChecked == true);
 
+    // Best-effort total size for the Files/Pages-scope preview header. Graph's children listing
+    // already returns an aggregate Size for folders (not just files), so this is accurate without
+    // a recursive walk — but CopyJob.SourceSize itself stays null until the copy-time enumeration
+    // walk (see CopyJob.cs), so this reads the originally-checked SharePointNodes instead. Blank
+    // (not a misleading partial sum) when any checked node's size isn't known yet, or when nothing
+    // sized is selected — e.g. Library/Site scope, where sizes aren't known until copy time.
+    public string CopyPreviewTotalSizeDisplay
+    {
+        get
+        {
+            var nodes = SourceLibraries.SelectMany(l => l.GetCheckedNodes())
+                .Where(n => n.Type is NodeType.File or NodeType.Folder)
+                .ToList();
+            if (nodes.Count == 0 || nodes.Any(n => n.Size == null)) return string.Empty;
+            return $" ({SizeFormatter.FormatBytes(nodes.Sum(n => n.Size ?? 0))})";
+        }
+    }
+
     // Libraries shown in the Options step preview for Library/Site scope.
     // The null (items-only) state only has meaning for custom lists — a stray null on
     // any other node type must not surface a phantom entry here.
@@ -601,6 +620,7 @@ public partial class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(ShowLibraryFullCopyMapping));
         OnPropertyChanged(nameof(LibrarySummaryCount));
         OnPropertyChanged(nameof(SelectedItemCount));
+        OnPropertyChanged(nameof(CopyPreviewTotalSizeDisplay));
         OnPropertyChanged(nameof(LibraryPreviewItems));
         NextCommand.NotifyCanExecuteChanged();
     }
@@ -738,6 +758,13 @@ public partial class MainViewModel : ObservableObject
     private long _bytesTotalTally, _bytesDoneTally, _packedBytesTally;
     private int  _bytesMissingCount;
 
+    // Sum of CopyResult.VersionsBytesTotal (falling back to SourceSize) across rows that finished —
+    // unlike _bytesTotalTally/_bytesDoneTally above, this only grows as each row COMPLETES (the true
+    // per-version total isn't known until then), so it can't be used for ETA pacing during the run.
+    // It's the authoritative "Total Size" once the run is done — see TotalSizeDisplay — since it
+    // reflects every version actually copied, not just each file's current version.
+    private long _bytesFinalTally;
+
     partial void OnCopyResultsChanged(ObservableCollection<CopyResult> value)
     {
         BindingOperations.EnableCollectionSynchronization(value, _copyResultsLock);
@@ -765,6 +792,7 @@ public partial class MainViewModel : ObservableObject
                 _fileTotalTally = _fileSuccessTally = _fileFailedTally = _fileSkippedTally = _fileCancelledTally = 0;
                 _bytesTotalTally = _bytesDoneTally = 0;
                 _bytesMissingCount = 0;
+                _bytesFinalTally = 0;
                 break;
         }
     }
@@ -809,6 +837,7 @@ public partial class MainViewModel : ObservableObject
         AdjustStatusTally(oldStatus, -1);
         AdjustStatusTally(newStatus, +1);
         AdjustBytesDoneTally(oldStatus, newStatus, row.SourceSize ?? 0);
+        AdjustFinalBytesTally(oldStatus, newStatus, row.VersionsBytesTotal ?? row.SourceSize ?? 0);
         if (!row.IsPermissionResult)
         {
             AdjustFileStatusTally(oldStatus, -1);
@@ -856,6 +885,14 @@ public partial class MainViewModel : ObservableObject
         bool isDone  = CountsTowardEtaDone(newStatus);
         if (wasDone == isDone) return;
         Interlocked.Add(ref _bytesDoneTally, isDone ? size : -size);
+    }
+
+    private void AdjustFinalBytesTally(CopyStatus oldStatus, CopyStatus newStatus, long size)
+    {
+        bool wasDone = CountsTowardEtaDone(oldStatus);
+        bool isDone  = CountsTowardEtaDone(newStatus);
+        if (wasDone == isDone) return;
+        Interlocked.Add(ref _bytesFinalTally, isDone ? size : -size);
     }
 
     private void AdjustFileStatusTally(CopyStatus status, int delta)
@@ -1137,6 +1174,25 @@ public partial class MainViewModel : ObservableObject
     public int FileFailedCount    => _fileFailedTally;
     public int FileSkippedCount   => _fileSkippedTally;
     public int FileCancelledCount => _fileCancelledTally;
+
+    // Total/copied-so-far size for display, reusing the same byte tallies ShouldUseBytesEta already
+    // maintains for the ETA calculation. Blank whenever too many rows are missing a SourceSize (same
+    // threshold as ShouldUseBytesEta) — showing a partial byte sum next to a complete item count
+    // would understate "Total Size" rather than just omitting it.
+    public bool HasKnownTotalSize => ShouldUseBytesEta(TotalCount);
+    // Once the run is complete, _bytesFinalTally (every version actually copied, per row) is the more
+    // accurate figure — _bytesTotalTally only ever reflects each file's current version, since that's
+    // all that's knowable before/during the copy (see CopyResult.SourceSize). Switching only after
+    // completion keeps the in-progress Step 4 display (DoneSizeDisplay vs. this) internally consistent
+    // — a mid-copy denominator that could grow past what ETA pacing expects would make "done" exceed
+    // "total" and break the remaining-time math.
+    public string TotalSizeDisplay  => HasKnownTotalSize
+        ? SizeFormatter.FormatBytes(IsCopyComplete ? _bytesFinalTally : _bytesTotalTally)
+        : string.Empty;
+    public string DoneSizeDisplay   => HasKnownTotalSize ? SizeFormatter.FormatBytes(_bytesDoneTally)  : string.Empty;
+    // Pre-formatted so the Step 4 progress line's Run can bind Text alone — Run isn't a UIElement
+    // and has no Visibility property to hide a separate "of X" segment when size is unknown.
+    public string SizeProgressDisplay => HasKnownTotalSize ? $"  ·  {DoneSizeDisplay} of {TotalSizeDisplay}" : string.Empty;
 
     public double PermColumnWidth        => CopyPermissions ? 100 : 0;
     public double PermDetailsColumnWidth => CopyPermissions ? 200 : 0;
@@ -2645,6 +2701,10 @@ public partial class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(FileSuccessCount));
         OnPropertyChanged(nameof(FileFailedCount));
         OnPropertyChanged(nameof(FileSkippedCount));
+        OnPropertyChanged(nameof(HasKnownTotalSize));
+        OnPropertyChanged(nameof(TotalSizeDisplay));
+        OnPropertyChanged(nameof(DoneSizeDisplay));
+        OnPropertyChanged(nameof(SizeProgressDisplay));
     }
 
     private void UpdateMetadataProgress()
@@ -2685,6 +2745,10 @@ public partial class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(FileSuccessCount));
         OnPropertyChanged(nameof(FileFailedCount));
         OnPropertyChanged(nameof(FileSkippedCount));
+        OnPropertyChanged(nameof(HasKnownTotalSize));
+        OnPropertyChanged(nameof(TotalSizeDisplay));
+        OnPropertyChanged(nameof(DoneSizeDisplay));
+        OnPropertyChanged(nameof(SizeProgressDisplay));
     }
 
     // Public wrapper so code-behind and dialogs can fire property change notifications.
@@ -2932,6 +2996,7 @@ public partial class MainViewModel : ObservableObject
                 SkippedCount   = SkippedCount,
                 CancelledCount = CancelledCount,
                 TotalCount     = TotalCount,
+                TotalSize      = HasKnownTotalSize ? _bytesFinalTally : 0,
                 CopyMode     = CopyMode,
                 Items        = CopyResults.Select(r => new SavedReportItem
                 {

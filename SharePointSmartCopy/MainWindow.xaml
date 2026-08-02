@@ -1136,6 +1136,7 @@
                                        Visibility="{Binding IsFilesOrPagesScope, Converter={StaticResource BoolToVis}}">
                                 <Run Text="{Binding CopyJobs.Count, Mode=OneWay}" FontWeight="Bold"/>
                                 <Run Text="items selected"/>
+                                <Run Text="{Binding CopyPreviewTotalSizeDisplay, Mode=OneWay}"/>
                             </TextBlock>
                             <TextBlock FontSize="13" Foreground="{DynamicResource TextSecondaryBrush}"
                                        Visibility="{Binding ShowLibrarySummaryLine, Converter={StaticResource BoolToVis}}">
@@ -1327,6 +1328,7 @@
                                 <Run Text=" of "/>
                                 <Run Text="{Binding TotalCount}"/>
                                 <Run Text=" items processed"/>
+                                <Run Text="{Binding SizeProgressDisplay, Mode=OneWay}" Foreground="{DynamicResource TextTertiaryBrush}"/>
                                 <Run Text="{Binding EstimatedTimeRemaining}" Foreground="{DynamicResource TextTertiaryBrush}"/>
                             </TextBlock>
                             <TextBlock HorizontalAlignment="Right" FontSize="13" FontWeight="SemiBold">
@@ -1557,6 +1559,16 @@
                             <TextBlock Text="{Binding CopyDuration}" FontSize="28" FontWeight="Bold"
                                        Foreground="{DynamicResource TextSecondaryBrush}" HorizontalAlignment="Center"/>
                             <TextBlock Text="Duration" Foreground="{DynamicResource TextTertiaryBrush}" HorizontalAlignment="Center" FontSize="13"/>
+                        </StackPanel>
+                    </Border>
+                    <!-- Hidden whenever too many rows lack a SourceSize to trust the total (see
+                         HasKnownTotalSize) — e.g. Library/Site-scope or permission-only runs. -->
+                    <Border Style="{StaticResource SummaryCard}" Background="{DynamicResource WindowBgBrush}" BorderBrush="{DynamicResource BorderLightBrush}"
+                            Visibility="{Binding HasKnownTotalSize, Converter={StaticResource BoolToVis}}">
+                        <StackPanel>
+                            <TextBlock Text="{Binding TotalSizeDisplay}" FontSize="28" FontWeight="Bold"
+                                       Foreground="{DynamicResource TextSecondaryBrush}" HorizontalAlignment="Center"/>
+                            <TextBlock Text="Total Size" Foreground="{DynamicResource TextTertiaryBrush}" HorizontalAlignment="Center" FontSize="13"/>
                         </StackPanel>
                     </Border>
                     <!-- Only shown when the run was cancelled or the app closed mid-copy — a fully

@@ -32,7 +32,7 @@ public partial class SharePointNode : ObservableObject
 
     public bool IsPlaceholder => Name == "__placeholder__";
 
-    public string SizeDisplay => Size.HasValue ? FormatSize(Size.Value) : string.Empty;
+    public string SizeDisplay => SizeFormatter.FormatBytes(Size);
 
     // Segoe Fluent Icons / Segoe MDL2 Assets glyph codepoints — rendered with the
     // shared GlyphIcon style (Themes/AppStyles.xaml), not as emoji text.
@@ -83,11 +83,4 @@ public partial class SharePointNode : ObservableObject
         };
     }
 
-    private static string FormatSize(long bytes)
-    {
-        if (bytes < 1024) return $"{bytes} B";
-        if (bytes < 1024 * 1024) return $"{bytes / 1024.0:N1} KB";
-        if (bytes < 1024L * 1024 * 1024) return $"{bytes / (1024.0 * 1024):N1} MB";
-        return $"{bytes / (1024.0 * 1024 * 1024):N2} GB";
-    }
 }

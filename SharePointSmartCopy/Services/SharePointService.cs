@@ -2645,6 +2645,28 @@ public class SharePointService
         catch { return null; }
     }
 
+    // Public wrapper around GetFolderCurrentMetadataAsync for callers outside this class that need a
+    // pre-existing folder's OWN current dates/authorship — e.g. MigrationJobService stamping a
+    // manifest SPFolder entry for a destination container folder that isn't part of the copied source
+    // tree (no source-side FileMetadata exists for it). Returning its real current values, rather than
+    // MigrationPackageBuilder's hardcoded placeholder date, makes that manifest entry a no-op restate
+    // instead of overwriting the folder's real dates on import (see the 2026-08-02 fix).
+    public async Task<FileMetadata?> GetFolderOwnMetadataAsync(string siteUrl, string folderUniqueId)
+    {
+        var m = await GetFolderCurrentMetadataAsync(siteUrl, folderUniqueId);
+        if (m == null) return null;
+        var (_, authorEmail, editorEmail, created, modified, colorTag, colorHex) = m.Value;
+        return new FileMetadata
+        {
+            CreatedDateTime  = created,
+            CreatedByEmail   = authorEmail,
+            ModifiedDateTime = modified,
+            ModifiedByEmail  = editorEmail,
+            ColorTag         = colorTag,
+            ColorHex         = colorHex,
+        };
+    }
+
     private static bool EmailsMatch(string? actual, string? expected) =>
         !string.IsNullOrEmpty(actual) && string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase);
 

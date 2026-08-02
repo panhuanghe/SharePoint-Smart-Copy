@@ -95,7 +95,11 @@ public static class ExcelReportWriter
         ws.Cell(12, 2).Value = onlyInTarget;
         ws.Cell(13, 1).Value = "Unverified (no comparable signal)";
         ws.Cell(13, 2).Value = unverified;
-        ws.Range(6, 1, 13, 1).Style.Font.Bold = true;
+        ws.Cell(14, 1).Value = "Total Size in Source";
+        ws.Cell(14, 2).Value = SizeFormatter.FormatBytes(result.SourceFiles.Sum(f => f.Size ?? 0));
+        ws.Cell(15, 1).Value = "Total Size in Target";
+        ws.Cell(15, 2).Value = SizeFormatter.FormatBytes(result.TargetFiles.Sum(f => f.Size ?? 0));
+        ws.Range(6, 1, 15, 1).Style.Font.Bold = true;
 
         ws.Columns(1, 2).AdjustToContents();
     }

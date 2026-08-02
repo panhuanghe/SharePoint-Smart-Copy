@@ -341,24 +341,27 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                     {
                         cancellationToken.ThrowIfCancellationRequested();
                         var (driveId, itemId, name, relativePath) = (entry.DriveId, entry.ItemId, entry.Name, entry.RelativePath);
-                        scannedFiles++;
-                        if (DateTimeOffset.UtcNow - lastScanReport >= TimeSpan.FromSeconds(3))
-                        {
-                            lastScanReport = DateTimeOffset.UtcNow;
-                            activityLog?.Report($"Scanning source: {scannedFiles:N0} file(s) found so far...");
-                        }
 
                         // Identity-only entry for an ordinary folder (see SourceFileEntry.IsFolder) —
                         // never creates a grid row or copy job here; just record its (driveId, itemId)
                         // for the folder-metadata passes further down (both engines), which still do
                         // their own per-folder metadata+color fetch — this only saves them from having
-                        // to FIND the folder's item id themselves.
+                        // to FIND the folder's item id themselves. Excluded from scannedFiles: counting
+                        // it there inflated the "file(s) found" tally with folders that never become a
+                        // grid row, so it drifted far ahead of the progress bar's real total (CopyResults.Count).
                         if (entry.IsFolder)
                         {
                             if (!scannedFoldersByJob.TryGetValue(job, out var jobFolders))
                                 scannedFoldersByJob[job] = jobFolders = [];
                             jobFolders.Add((driveId, itemId, relativePath));
                             continue;
+                        }
+
+                        scannedFiles++;
+                        if (DateTimeOffset.UtcNow - lastScanReport >= TimeSpan.FromSeconds(3))
+                        {
+                            lastScanReport = DateTimeOffset.UtcNow;
+                            activityLog?.Report($"Scanning source: {scannedFiles:N0} file(s) found so far...");
                         }
 
                         // Special folder (e.g. a OneNote notebook — see SourceFileEntry.IsSpecialFolder):
@@ -1095,7 +1098,8 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         var versions    = maxVersions > 0 && allVersions.Count > maxVersions
             ? allVersions.TakeLast(maxVersions).ToList()
             : allVersions;
-        result.VersionsTotal = versions.Count;
+        result.VersionsTotal      = versions.Count;
+        result.VersionsBytesTotal = versions.Sum(v => v.Size ?? metadata.Size ?? job.SourceSize ?? 0);
 
         string targetItemId = string.Empty;
 

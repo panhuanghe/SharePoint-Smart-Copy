@@ -72,6 +72,10 @@ public class SavedReport
     public int CancelledCount { get; set; }
     public int TotalCount { get; set; }
     public TimeSpan Duration { get; set; }
+    // Sum of CopyResult.SourceSize across the run. 0 for runs where size wasn't known for any row
+    // (e.g. Library/Site-scope or permission-only copies) — see MainViewModel.HasKnownTotalSize for
+    // the same "don't show a misleading partial sum" reasoning applied to the live progress screens.
+    public long TotalSize { get; set; }
 
     [JsonConverter(typeof(JsonStringEnumConverter))]
     public CopyMode CopyMode { get; set; }
@@ -97,9 +101,14 @@ public class SavedReport
     }
 
     [JsonIgnore]
+    public string SizeDisplay => TotalSize > 0 ? SizeFormatter.FormatBytes(TotalSize) : string.Empty;
+
+    [JsonIgnore]
     public string Summary => CancelledCount > 0
-        ? $"✅ {SuccessCount}   ❌ {FailedCount}   ⏭ {SkippedCount}   🚫 {CancelledCount}   ⏱ {DurationDisplay}"
-        : $"✅ {SuccessCount}   ❌ {FailedCount}   ⏭ {SkippedCount}   ⏱ {DurationDisplay}";
+        ? $"✅ {SuccessCount}   ❌ {FailedCount}   ⏭ {SkippedCount}   🚫 {CancelledCount}   ⏱ {DurationDisplay}{SizeSummarySuffix}"
+        : $"✅ {SuccessCount}   ❌ {FailedCount}   ⏭ {SkippedCount}   ⏱ {DurationDisplay}{SizeSummarySuffix}";
+
+    private string SizeSummarySuffix => TotalSize > 0 ? $"   📦 {SizeDisplay}" : string.Empty;
 }
 
 // Everything the History list needs to show one row, deliberately WITHOUT Items. Deserializing a
@@ -123,6 +132,7 @@ public class SavedReportSummary
     public int CancelledCount { get; set; }
     public int TotalCount { get; set; }
     public TimeSpan Duration { get; set; }
+    public long TotalSize { get; set; }
 
     [JsonConverter(typeof(JsonStringEnumConverter))]
     public CopyMode CopyMode { get; set; }
@@ -144,7 +154,12 @@ public class SavedReportSummary
     }
 
     [JsonIgnore]
+    public string SizeDisplay => TotalSize > 0 ? SizeFormatter.FormatBytes(TotalSize) : string.Empty;
+
+    [JsonIgnore]
     public string Summary => CancelledCount > 0
-        ? $"✅ {SuccessCount}   ❌ {FailedCount}   ⏭ {SkippedCount}   🚫 {CancelledCount}   ⏱ {DurationDisplay}"
-        : $"✅ {SuccessCount}   ❌ {FailedCount}   ⏭ {SkippedCount}   ⏱ {DurationDisplay}";
+        ? $"✅ {SuccessCount}   ❌ {FailedCount}   ⏭ {SkippedCount}   🚫 {CancelledCount}   ⏱ {DurationDisplay}{SizeSummarySuffix}"
+        : $"✅ {SuccessCount}   ❌ {FailedCount}   ⏭ {SkippedCount}   ⏱ {DurationDisplay}{SizeSummarySuffix}";
+
+    private string SizeSummarySuffix => TotalSize > 0 ? $"   📦 {SizeDisplay}" : string.Empty;
 }

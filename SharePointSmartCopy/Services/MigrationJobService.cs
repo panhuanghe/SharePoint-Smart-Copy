@@ -2003,6 +2003,38 @@ public class MigrationJobService(SharePointService spService)
                     throw new Exception($"Could not resolve {unresolved.Count} target subfolder ID(s) — SharePoint throttling exhausted retries (e.g. '{unresolved[0]}'). Batch not submitted; re-run (ideally off-peak).");
             }
 
+            // A path in folderGuids with no folderMetadata entry is a folder that isn't part of the
+            // copied SOURCE tree at all — typically a pre-existing destination container the user
+            // copied INTO (folderMetadata is built purely from source folders, see ExecuteAsync).
+            // MigrationPackageBuilder's FolderTimeAndAuthor falls back to a hardcoded placeholder date
+            // for any such gap, and SPMI's import actually STAMPS that placeholder onto the existing
+            // target folder identified by its GUID — corrupting an unrelated folder's real Modified
+            // date to "2000-01-01T00:00:00Z" (shows as Dec 31 1999 in a negative-UTC-offset timezone;
+            // confirmed live 2026-08-02). Since there's no source folder to borrow real dates from,
+            // fetch the container's own CURRENT dates instead — a self-referential no-op restate that
+            // can't corrupt anything, unlike the placeholder.
+            var effectiveFolderMetadata = folderMetadata != null
+                ? new Dictionary<string, FileMetadata>(folderMetadata, StringComparer.OrdinalIgnoreCase)
+                : new Dictionary<string, FileMetadata>(StringComparer.OrdinalIgnoreCase);
+            var selfReferentialPaths = folderGuids.Keys
+                .Where(p => !effectiveFolderMetadata.ContainsKey(p))
+                .ToList();
+            if (!string.IsNullOrEmpty(rootFolderGuid) && !effectiveFolderMetadata.ContainsKey(string.Empty))
+                selfReferentialPaths.Add(string.Empty);
+            if (selfReferentialPaths.Count > 0)
+            {
+                var metaLock = new object();
+                await Parallel.ForEachAsync(selfReferentialPaths,
+                    new ParallelOptions { MaxDegreeOfParallelism = 6, CancellationToken = cancellationToken },
+                    async (path, ct) =>
+                    {
+                        var guid = path.Length == 0 ? rootFolderGuid! : folderGuids[path];
+                        var meta = await spService.GetFolderOwnMetadataAsync(targetSiteUrl, guid);
+                        if (meta != null)
+                            lock (metaLock) effectiveFolderMetadata[path] = meta;
+                    });
+            }
+
             // IfNewer behaves like overwrite from SPMI's perspective: stale targets were
             // already deleted in step 2b, so surviving imports must be allowed to replace.
             var spmiOverwrite = overwriteMode != OverwriteMode.Skip;
@@ -2016,7 +2048,7 @@ public class MigrationJobService(SharePointService spService)
             var manifests = builder.BuildManifestXml(
                 siteId, webId, listId,
                 targetSiteUrl, webRelUrl, libraryTitle, libraryServerRelUrl,
-                spmiOverwrite, rootFolderGuid, folderGuids, folderMetadata);
+                spmiOverwrite, rootFolderGuid, folderGuids, effectiveFolderMetadata);
 
             foreach (var (blobName, data) in manifests)
             {
@@ -2343,7 +2375,8 @@ public class MigrationJobService(SharePointService spService)
             ? allVersions.TakeLast(maxVersions).ToList()
             : allVersions;
 
-        result.VersionsTotal = versions.Count;
+        result.VersionsTotal      = versions.Count;
+        result.VersionsBytesTotal = versions.Sum(v => v.Size ?? metadata.Size ?? job.SourceSize ?? 0);
 
         // Download all version content concurrently, buffering each stream immediately so the
         // HTTP connection is consumed before it can go stale. Index-keyed array preserves order.

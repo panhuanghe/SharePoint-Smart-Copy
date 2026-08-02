@@ -278,9 +278,16 @@ public sealed class VerificationReportService(SharePointService spService)
     // touched by SharePoint's backend re-serialization — the churn comes from OneNote's own
     // MS-ONESTORE storage format and its client/server sync-and-consolidation behavior, which can
     // rewrite a section file's bytes with no logical content change. Different mechanism, same
-    // false-positive symptom, so it gets the same date-based fallback rather than its own bespoke
-    // path. Confirmed 2026-07-21: .one files were showing ContentMismatch on size alone despite the
-    // user confirming identical content — .one/.onetoc2 were previously in neither set here.
+    // false-positive symptom, so it was first given the same date-based fallback used for
+    // OOXML/OLE. Confirmed 2026-07-21: .one files were showing ContentMismatch on size alone
+    // despite the user confirming identical content — .one/.onetoc2 were previously in neither set
+    // here.
+    // Confirmed 2026-08-01: date turned out to be just as unreliable — a live verification run
+    // showed every .one/.onetoc2 row's target Modified date landed at the copy's own run
+    // timestamp, seconds apart across unrelated files, regardless of what PatchFileSystemDate had
+    // set. OneNote's server-side consolidation re-stamps Modified when it rewrites a section's
+    // bytes, unlike OOXML/OLE re-serialization which leaves Modified alone (see ClassifyMatch) —
+    // so these extensions are reported Unverified instead of DateMismatch; see ClassifyMatch.
     internal static readonly HashSet<string> OneNoteExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         ".one", ".onetoc2",
@@ -322,6 +329,13 @@ public sealed class VerificationReportService(SharePointService spService)
                 SourceSize     = s.Size,
                 TargetSize     = t?.Size
             };
+            if (row.Status == ComparisonStatus.Unverified && t != null &&
+                OneNoteExtensions.Contains(Path.GetExtension(s.RelativePath)))
+            {
+                row.Note = "OneNote rewrites this file's content and Modified date server-side " +
+                           "independently of the copy — neither hash nor date can confirm or " +
+                           "refute a content difference here. Open the notebook to check manually if needed.";
+            }
             rows.Add(row);
 
             // Candidates need both sides present (to download both) and an OOXML extension (the
@@ -488,6 +502,15 @@ public sealed class VerificationReportService(SharePointService spService)
             // for Migration API imports, which bypass the upload pipeline). Only a hash
             // DIFFERENCE is meaningless for these formats.
             if (hashesEqual) return ComparisonStatus.Match;
+
+            // OneNote's consolidation doesn't just rewrite bytes — it re-stamps the item's own
+            // Modified date too (confirmed 2026-08-01: target dates landed at the copy's own
+            // timestamp regardless of what was patched in), so unlike the OOXML/OLE formats
+            // above, date isn't a stable fallback signal here either. Neither hash nor date can
+            // confirm or refute a genuine content difference for these files, so report
+            // Unverified rather than a false-alarm DateMismatch.
+            if (OneNoteExtensions.Contains(Path.GetExtension(s.RelativePath)))
+                return ComparisonStatus.Unverified;
 
             // Otherwise modified date is the signal, since the app is already responsible for
             // preserving it onto the target. A missing date on either side is Unverified — the

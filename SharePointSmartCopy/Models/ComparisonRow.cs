@@ -17,6 +17,10 @@ namespace SharePointSmartCopy.Models;
 // size is missing too, the row is reported as Unverified — never as a fabricated Match. Office/OLE
 // rows additionally short-circuit to Match when both quickXorHashes are present and EQUAL (equal
 // hashes are always trustworthy; they only stop being meaningful when they differ).
+// OneNote (.one/.onetoc2) is grouped with Office/OLE for the hash-unreliable symptom, but doesn't
+// get the date fallback the others do: OneNote's server-side consolidation re-stamps Modified along
+// with the bytes, so date drifts independently on each side too. These are reported Unverified
+// (with an explanatory Note) rather than a false-alarm DateMismatch — see VerificationReportService.
 //
 // The opt-in "Deep verify Office files" pass (see VerificationReportService's deep-verify pass and
 // OpcDeepComparer) can additionally resolve a ContentMismatch/DateMismatch to Match when the OOXML
