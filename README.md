@@ -57,6 +57,7 @@ Choose from four copy scopes in a step-by-step wizard:
 - History opens instantly regardless of run size — a saved run's full per-file results load only when you open, export, or verify that run, not for every entry in the list
 - **Cancelled status** — items still in progress when a run is stopped or the app closes mid-copy are reported as Cancelled rather than Failed, so an interrupted run's summary doesn't look like a mass failure
 - **Large-file transfer reliability** — a self-tuning upload-concurrency gate and a global in-memory byte budget keep libraries containing many very large (multi-GB) files copying without exhausting memory or saturating the upload path
+- **Total Size** shown alongside item counts on the preview, in-progress, and report screens, in the Excel verification report, and in History — including bytes from copied version history, not just each file's current version
 
 **Files scope:**
 - Full version history — version numbers, dates, and per-version editors preserved exactly
@@ -69,7 +70,7 @@ Choose from four copy scopes in a step-by-step wizard:
 **Copy log:**
 - Filter chips — All / Success / Failed / Skipped — on both the progress and report screens
 - Scales to 100,000+ files without UI freeze — batched row rendering and coalesced auto-scroll
-- Default report/verification filenames are prefixed with the source and target site names (e.g. `Marketing-Archive-CopyReport_Files_...csv`) — can be turned off in Settings
+- Default report/verification filenames are prefixed with the source and target site names, including OneDrive personal sites (e.g. `Marketing-Archive-CopyReport_Files_...csv`) — can be turned off in Settings
 
 **Appearance:**
 - Light / Dark / System theme — switchable in Settings

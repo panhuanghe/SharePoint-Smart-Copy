@@ -75,7 +75,7 @@
                                     <Run Text="→ "/>
                                     <Run Text="{Binding TargetUrl}"/>
                                 </TextBlock>
-                                <TextBlock Text="{Binding Summary}" FontSize="12"
+                                <TextBlock Text="{Binding Summary}" FontSize="12" TextWrapping="Wrap"
                                            Foreground="{DynamicResource TextSecondaryBrush}" Margin="0,4,0,0"/>
                             </StackPanel>
                         </DataTemplate>

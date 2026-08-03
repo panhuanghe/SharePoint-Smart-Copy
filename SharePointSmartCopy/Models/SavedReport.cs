@@ -108,7 +108,7 @@ public class SavedReport
         ? $"✅ {SuccessCount}   ❌ {FailedCount}   ⏭ {SkippedCount}   🚫 {CancelledCount}   ⏱ {DurationDisplay}{SizeSummarySuffix}"
         : $"✅ {SuccessCount}   ❌ {FailedCount}   ⏭ {SkippedCount}   ⏱ {DurationDisplay}{SizeSummarySuffix}";
 
-    private string SizeSummarySuffix => TotalSize > 0 ? $"   📦 {SizeDisplay}" : string.Empty;
+    private string SizeSummarySuffix => TotalSize > 0 ? $"   ·  {SizeDisplay}" : string.Empty;
 }
 
 // Everything the History list needs to show one row, deliberately WITHOUT Items. Deserializing a
@@ -161,5 +161,5 @@ public class SavedReportSummary
         ? $"✅ {SuccessCount}   ❌ {FailedCount}   ⏭ {SkippedCount}   🚫 {CancelledCount}   ⏱ {DurationDisplay}{SizeSummarySuffix}"
         : $"✅ {SuccessCount}   ❌ {FailedCount}   ⏭ {SkippedCount}   ⏱ {DurationDisplay}{SizeSummarySuffix}";
 
-    private string SizeSummarySuffix => TotalSize > 0 ? $"   📦 {SizeDisplay}" : string.Empty;
+    private string SizeSummarySuffix => TotalSize > 0 ? $"   ·  {SizeDisplay}" : string.Empty;
 }

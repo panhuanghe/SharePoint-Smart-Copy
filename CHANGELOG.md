@@ -4,6 +4,25 @@ All notable changes to SharePoint Smart Copy are documented here.
 
 ---
 
+## 3.5.0 — 2026-08-02
+
+### Added
+
+- **Total Size shown alongside item counts** — the total bytes involved are now shown next to the existing item counts throughout the app: the Copy Preview header, the in-progress copy line, a new "Total Size" tile on the Copy Report screen, the Excel verification report's Overview sheet, and each run's History summary. Once a run finishes, this figure also accounts for every version actually copied when "Copy versions" is on, not just each file's current version — reusing the same per-file size data the app already tracked for its time-remaining estimate, so no extra Graph calls are needed. Left blank whenever too many rows lack a knowable size (e.g. Library/Site-scope or permission-only copies) rather than showing a misleading partial number.
+- **Report filenames now recognize OneDrive personal sites** — a source or target URL under `/personal/{username}/` is now prefixed onto default report filenames the same way `/sites/`/`/teams/` site names already were.
+
+### Changed
+
+- **Site/user names used in report filenames are now percent-decoded** — a non-ASCII name (e.g. an accented or non-Latin site or OneDrive user name) previously showed up in filenames as a raw `%XX`-escaped string instead of its real characters.
+
+### Fixed
+
+- **OneNote (.one/.onetoc2) false-positive "Date Mismatch"** — a live verification report showed every target file's Modified date landing at the copy run's own timestamp regardless of what was preserved, because OneNote's server-side consolidation re-stamps Modified along with the bytes whenever it rewrites a section file, unlike other Office formats it's grouped with for the same hash-unreliable symptom. Date isn't a stable fallback signal for these two extensions either, so they're now reported "Unverified" with an explanatory note instead of a false alarm.
+- **A pre-existing destination folder's Modified date could be corrupted to "Dec 31, 1999"** in Migration API mode — copying into an existing container folder that wasn't itself part of the copied source tree left no source-side metadata to stamp onto its SPMI manifest entry, so it fell back to a hardcoded placeholder date that SharePoint's import then applied for real, overwriting the folder's actual date. The container folder's own current dates are now used instead, making that manifest entry a no-op.
+- **History's per-run summary could silently clip its own text** — the Total Size figure above was invisible for any run whose summary line grew long enough to overflow the fixed-width run list, since the list's default horizontal scroll region clips overflow with no wrapping or ellipsis to indicate it. The summary now wraps instead of overflowing.
+
+---
+
 ## 3.4.1 — 2026-07-29
 
 ### Added

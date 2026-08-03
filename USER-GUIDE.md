@@ -2,7 +2,7 @@
 
 *Copy files and folders between SharePoint Online sites*
 
-**Version 3.4.1  ·  July 2026**
+**Version 3.5.0  ·  August 2026**
 
 ---
 
@@ -38,6 +38,7 @@ Two copy engines are available. **Migration API** mode uses SharePoint's server-
 - Parallel transfers with 1–16 simultaneous file copies for faster bulk operations
 - Real-time progress monitoring with per-file status updates (Enhanced REST) or job-level results (Migration API)
 - Copy report with succeeded, failed, and skipped counts, inline permission status, and CSV export
+- **Total Size** shown alongside item counts on the preview, in-progress, and report screens, in the Excel verification report, and in History
 - **OneNote notebooks** copy correctly as a single native operation, preserving their special notebook association instead of being rebuilt as a plain folder of files
 - **Verification Report** — independently re-scans source and target after a run and produces an Excel workbook confirming what actually matches
 - **Compare** — generate the same kind of difference report for any source and target you connect to, without needing a prior copy or a saved history entry
