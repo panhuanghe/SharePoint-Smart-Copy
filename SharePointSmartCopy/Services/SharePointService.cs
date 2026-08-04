@@ -1837,7 +1837,7 @@ public class SharePointService
     //     one of these entries
     // What remains (metadata + color in one call via GetFileMetadataAsync) is unchanged from the old
     // per-folder cost — same gate/backoff pattern as FetchFolderMetadataAsync.
-    public async Task<Dictionary<string, FileMetadata>> FetchFolderMetadataByIdentityAsync(
+    public async Task<(Dictionary<string, FileMetadata> Metadata, List<(string FolderKey, string Error)> Failures)> FetchFolderMetadataByIdentityAsync(
         IReadOnlyList<(string folderKey, string driveId, string itemId)> folders,
         int maxConcurrency,
         IProgress<int>? progress = null,
@@ -1845,7 +1845,8 @@ public class SharePointService
     {
         int completed = 0;
         var result = new System.Collections.Concurrent.ConcurrentDictionary<string, FileMetadata>();
-        if (folders.Count == 0) return new Dictionary<string, FileMetadata>();
+        var failures = new System.Collections.Concurrent.ConcurrentBag<(string FolderKey, string Error)>();
+        if (folders.Count == 0) return (new Dictionary<string, FileMetadata>(), []);
 
         using var gate = CreateThrottleAwareGate(maxConcurrency, Math.Min(Math.Max(1, maxConcurrency), 2));
         void onThrottle(TimeSpan delay, int __, int ___, string? ____) => gate.StepDown(delay);
@@ -1861,10 +1862,14 @@ public class SharePointService
                     {
                         result[f.folderKey] = await GetFileMetadataAsync(f.driveId, f.itemId, includeFolderColor: true);
                     }
-                    catch { /* keep placeholder */ }
+                    // Previously a bare `catch { }` — swallowed the real reason (429 vs. 404 vs.
+                    // auth vs. timeout) entirely, so "Graph lookup failed after retries" was a guess,
+                    // not a diagnosis. Capturing the exception here is what let us tell throttling
+                    // apart from a genuinely missing/inaccessible item (2026-08-04 investigation).
+                    catch (Exception ex) { failures.Add((f.folderKey, $"{ex.GetType().Name}: {ex.Message}")); }
                     finally { gate.Release(); progress?.Report(Interlocked.Increment(ref completed)); }
                 });
-            return new Dictionary<string, FileMetadata>(result);
+            return (new Dictionary<string, FileMetadata>(result), [.. failures]);
         }
         finally { Throttled -= onThrottle; }
     }

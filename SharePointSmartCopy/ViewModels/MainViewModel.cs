@@ -1154,6 +1154,16 @@ public partial class MainViewModel : ObservableObject
     private static readonly TimeSpan EtaWindow = TimeSpan.FromSeconds(20);
     private readonly Queue<(DateTimeOffset Time, long Done)> _etaSamples = new();
     private readonly Queue<(DateTimeOffset Time, long Done)> _packSamples = new();
+
+    // Damps tick-to-tick jitter in the displayed ETA — e.g. one large file finishing produces a
+    // momentary rate spike (windowProgress jumps), and the very next tick with no completions can
+    // fall back to the anchor-average branch in ComputeRemaining, which uses a completely different
+    // rate. Without smoothing, that read as the estimate leaping from "1 minute" to "48 minutes" and
+    // back on a byte-weighted, mixed-file-size run. See SmoothSeconds.
+    private double?         _etaSmoothedSeconds;
+    private DateTimeOffset? _etaSmoothedTime;
+    private double?         _packEtaSmoothedSeconds;
+    private DateTimeOffset? _packEtaSmoothedTime;
     private DateTimeOffset  _metadataStartTime;
     private DateTimeOffset? _metadataRateAnchorTime;
     private int             _metadataRateAnchorDone;
@@ -1236,6 +1246,10 @@ public partial class MainViewModel : ObservableObject
         _etaStartDone = 0;
         _packStartTime = null;
         _packStartDone = 0;
+        _etaSmoothedSeconds = null;
+        _etaSmoothedTime    = null;
+        _packEtaSmoothedSeconds = null;
+        _packEtaSmoothedTime    = null;
         _etaSamples.Clear();
         _packSamples.Clear();
         TotalCount    = CopyJobs.Count;
@@ -2584,7 +2598,9 @@ public partial class MainViewModel : ObservableObject
     private const double EtaMinConfidenceSeconds = 15;
     private const double EtaMinConfidenceFraction = 0.02;
 
-    private static string? ComputeRemaining(
+    // Returns raw remaining seconds (unsmoothed) — see SmoothSeconds for the damping layer callers
+    // apply before formatting for display.
+    private static double? ComputeRemaining(
         long doneUnits, long totalUnits, DateTimeOffset now,
         DateTimeOffset anchorTime, long anchorDoneUnits,
         Queue<(DateTimeOffset Time, long Done)> samples)
@@ -2619,7 +2635,30 @@ public partial class MainViewModel : ObservableObject
             return null;
 
         var remainingSecs = (totalUnits - doneUnits) * elapsedSecs / progressUnits;
-        return remainingSecs >= 2 ? FormatDuration(TimeSpan.FromSeconds(remainingSecs)) : null;
+        return remainingSecs >= 2 ? remainingSecs : null;
+    }
+
+    // Exponential moving average over the raw remaining-seconds estimate, with a time constant tied
+    // to EtaWindow so the smoothing keeps pace with (rather than lagging well behind, or barely
+    // damping) the rate calculation it's smoothing. `smoothed`/`lastTime` are the caller's persisted
+    // state for one ETA stream (main vs. packaging) — each stream smooths independently.
+    // A null raw value (not enough confidence yet) resets the state so a fresh run doesn't inherit a
+    // stale average from a previous phase or job.
+    private static double? SmoothSeconds(double? raw, ref double? smoothed, ref DateTimeOffset? lastTime, DateTimeOffset now)
+    {
+        if (raw == null) { smoothed = null; lastTime = null; return null; }
+        if (smoothed == null || lastTime == null)
+        {
+            smoothed = raw;
+            lastTime = now;
+            return smoothed;
+        }
+        var dt = (now - lastTime.Value).TotalSeconds;
+        lastTime = now;
+        if (dt <= 0) return smoothed;
+        var alpha = 1 - Math.Exp(-dt / EtaWindow.TotalSeconds);
+        smoothed += alpha * (raw.Value - smoothed.Value);
+        return smoothed;
     }
 
     private void UpdateProgress()
@@ -2661,7 +2700,9 @@ public partial class MainViewModel : ObservableObject
                 _packStartTime = now;
                 _packStartDone = packedUnits;
             }
-            packRemaining = ComputeRemaining(packedUnits, totalUnits, now, _packStartTime.Value, _packStartDone, _packSamples);
+            var rawPackRemaining = ComputeRemaining(packedUnits, totalUnits, now, _packStartTime.Value, _packStartDone, _packSamples);
+            var smoothedPackRemaining = SmoothSeconds(rawPackRemaining, ref _packEtaSmoothedSeconds, ref _packEtaSmoothedTime, now);
+            packRemaining = smoothedPackRemaining != null ? FormatDuration(TimeSpan.FromSeconds(smoothedPackRemaining.Value)) : null;
             PackagedEstimatedTimeRemaining = packRemaining != null ? $" · ~{packRemaining} remaining" : " · Calculating…";
         }
         else
@@ -2681,7 +2722,9 @@ public partial class MainViewModel : ObservableObject
                 _etaStartTime = now;
                 _etaStartDone = doneUnits;
             }
-            var remaining = ComputeRemaining(doneUnits, totalUnits, now, _etaStartTime.Value, _etaStartDone, _etaSamples);
+            var rawRemaining = ComputeRemaining(doneUnits, totalUnits, now, _etaStartTime.Value, _etaStartDone, _etaSamples);
+            var smoothedRemaining = SmoothSeconds(rawRemaining, ref _etaSmoothedSeconds, ref _etaSmoothedTime, now);
+            var remaining = smoothedRemaining != null ? FormatDuration(TimeSpan.FromSeconds(smoothedRemaining.Value)) : null;
             EstimatedTimeRemaining = remaining != null ? $" · ~{remaining} remaining" : " · Calculating…";
         }
         else if (done == 0 && packed > 0 && packed < total && _copyEndTime == null)

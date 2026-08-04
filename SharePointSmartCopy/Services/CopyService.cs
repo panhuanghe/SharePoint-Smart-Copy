@@ -233,9 +233,44 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
         // fixed width straight back into a depleted throttle budget.
         const int ScanMaxParallelism = 8;
         using var scanController = new AdaptiveParallelismController(ScanMaxParallelism);
-        void onScanThrottle(TimeSpan delay, int _, int __, string? ___) => scanController.StepDown(delay);
+
+        // Diagnostic-only counters (added to investigate escalating scan-phase throttle waits —
+        // see activity-20260803-093215.log): total time spent waiting out throttles and how many
+        // throttle events fired during this scan, so the "throttle overhead" of a run is visible
+        // in its own activity log instead of requiring after-the-fact log-timestamp arithmetic.
+        var scanThrottleStatsLock = new object();
+        int      scanThrottleEvents    = 0;
+        TimeSpan scanThrottleWaitTotal = TimeSpan.Zero;
+        void onScanThrottle(TimeSpan delay, int _, int __, string? ___)
+        {
+            scanController.StepDown(delay);
+            lock (scanThrottleStatsLock)
+            {
+                scanThrottleEvents++;
+                scanThrottleWaitTotal += delay;
+            }
+        }
+
+        // Surfaces the scan's own concurrency ceiling alongside the generic "Graph throttled" log
+        // line (which fires from a shared handler with no visibility into which phase/controller is
+        // active) — without this, a log review can see THAT the tenant throttled but not whether the
+        // scan's own step-down/restore logic is oscillating back into it. Same pattern already used
+        // for the main controller (above) and for Analysis/Downloads/Uploads in MigrationJobService.
+        if (activityLog != null)
+        {
+            int lastScanLimit = ScanMaxParallelism;
+            scanController.LimitChanged += n =>
+            {
+                bool down = n < lastScanLimit;
+                lastScanLimit = n;
+                activityLog.Report(down
+                    ? $"↓ Scan concurrency: {n}/{ScanMaxParallelism} (throttled)"
+                    : $"⬆ Scan concurrency: {n}/{ScanMaxParallelism} (recovering)");
+            };
+        }
 
         bool anyFolderJobs = jobs.Any(j => j.IsFolder);
+        var scanStartTime = DateTimeOffset.UtcNow;
         if (anyFolderJobs)
             activityLog?.Report("Scanning source for files to copy...");
         int scannedFiles = 0;
@@ -329,6 +364,18 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                 }
                 else
                 {
+                    // Seeded unconditionally (not lazily on the first IsFolder hit below) so a job
+                    // whose walk finds files but ZERO subfolders — e.g. a single leaf folder with no
+                    // nested directories — still gets an entry here. Without this, such a job was
+                    // entirely absent from scannedFoldersByJob, so the ownKey loop further down (which
+                    // iterates `foreach (var (folderJob, folders) in scannedFoldersByJob)`) never ran
+                    // for it either, leaving the job's OWN top-level folder with no identity at all —
+                    // not just a missing ancestor, but the job's actual root (confirmed 2026-08-04:
+                    // a "java" folder holding 11 flat files, no subfolders, never appeared in
+                    // scannedFolderIdentities even though it was the copy's own target).
+                    var jobFolders = new List<(string driveId, string itemId, string relativePath)>();
+                    scannedFoldersByJob[job] = jobFolders;
+
                     // Every file in the same source folder computes the IDENTICAL TargetSubFolderPath
                     // (see ComputeTargetSubFolder) — without this cache, a 250k-file/5,000-folder job
                     // allocates 250k separate-but-equal-content strings for a value that only has 5,000
@@ -351,8 +398,6 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                         // grid row, so it drifted far ahead of the progress bar's real total (CopyResults.Count).
                         if (entry.IsFolder)
                         {
-                            if (!scannedFoldersByJob.TryGetValue(job, out var jobFolders))
-                                scannedFoldersByJob[job] = jobFolders = [];
                             jobFolders.Add((driveId, itemId, relativePath));
                             continue;
                         }
@@ -509,7 +554,21 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
             spService.Throttled -= onScanThrottle;
         }
         if (anyFolderJobs)
-            activityLog?.Report($"Source scan complete: {scannedFiles:N0} file(s) found");
+        {
+            var scanElapsed = DateTimeOffset.UtcNow - scanStartTime;
+            int      throttleEvents;
+            TimeSpan throttleWaitTotal;
+            lock (scanThrottleStatsLock) { throttleEvents = scanThrottleEvents; throttleWaitTotal = scanThrottleWaitTotal; }
+            // Overhead ratio = fraction of the scan's wall-clock time spent waiting out throttles —
+            // a coarse but immediate signal of whether it's worth tuning scan concurrency/backoff at
+            // all, without needing an external log-timestamp analysis after the fact.
+            var overheadRatio = scanElapsed > TimeSpan.Zero
+                ? throttleWaitTotal.TotalSeconds / scanElapsed.TotalSeconds : 0;
+            activityLog?.Report($"Source scan complete: {scannedFiles:N0} file(s) found in {scanElapsed.TotalSeconds:0}s"
+                + (throttleEvents > 0
+                    ? $" ({throttleEvents} throttle event(s), {throttleWaitTotal.TotalSeconds:0}s waited, {overheadRatio:P0} throttle overhead)"
+                    : ""));
+        }
         await FlushPendingResultsAsync();
 
         // Flattens scannedFoldersByJob into the SAME key shape SPMI's folder-metadata correction

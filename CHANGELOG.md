@@ -4,6 +4,20 @@ All notable changes to SharePoint Smart Copy are documented here.
 
 ---
 
+## 3.5.1 — 2026-08-04
+
+### Changed
+
+- **Folder metadata lookup failures are now reported with their real cause** instead of a generic "Graph lookup failed after retries" guess — the fetch pass used to swallow every exception silently, so a genuinely throttled/missing item and a folder the scan simply never identified looked identical in the log. The activity log now distinguishes "no identity from the scan" (the folder was never part of this job's own walk — expected for some manually-retargeted single-folder copies) from an actual Graph exception, and shows the real exception text for the latter.
+- **The source-scan phase now reports its own throttle overhead** — total throttle events, time waited, and a wait/elapsed ratio alongside "Source scan complete," plus concurrency step-down/step-up lines matching the ones already shown for Analysis/Downloads/Uploads — so an unusually slow scan is diagnosable from its own log instead of requiring after-the-fact timestamp arithmetic.
+- **Estimated time remaining no longer jumps between wildly different values tick-to-tick** — a momentary rate spike (e.g. one large file finishing) previously could swing the displayed estimate from "1 minute" to "48 minutes" and back on the very next tick. Both the main and packaging ETAs are now smoothed with an exponential moving average tied to the same 20-second window already used for the underlying rate calculation.
+
+### Fixed
+
+- **A folder with no subfolders of its own never received its date/author/color correction in Migration API mode**, even with "Re-apply folder metadata every run" on — a leaf folder holding 11 files with no nested directories was entirely absent from the scan's per-job folder-identity map, because that map was only created the first time a *subfolder* was found during the job's walk. A job whose walk found files but zero subfolders never got an entry at all, so its own top-level folder — not just a missing ancestor — silently kept the placeholder "Dec 31, 1999" date on every run. This is a different gap from the 3.5.0 fix (which covered a folder whose walk *did* find subfolders elsewhere but never recorded the folder's own identity); together they should cover every folder shape.
+
+---
+
 ## 3.5.0 — 2026-08-02
 
 ### Added

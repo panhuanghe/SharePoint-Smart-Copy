@@ -553,6 +553,13 @@ public class MigrationJobService(SharePointService spService)
                         .Where(p => scannedFolderIdentities.ContainsKey(p))
                         .Select(p => (folderKey: p, scannedFolderIdentities[p].driveId, scannedFolderIdentities[p].itemId))
                         .ToList();
+                    // Distinct from a fetch failure below: these paths were never even attempted,
+                    // because the scan phase never produced an identity for them at all (a key-
+                    // matching gap between the scan's folder walk and this ancestor-path expansion,
+                    // NOT a Graph throttling/lookup failure — see the 2026-08-04 investigation).
+                    var unscannedAncestorPaths = allAncestorFolderPaths
+                        .Where(p => !scannedFolderIdentities.ContainsKey(p))
+                        .ToList();
                     if (byIdentityInput.Count > 0)
                         activityLog?.Report($"Fetching metadata for {byIdentityInput.Count:N0} folders...");
                     var byIdentityProgress = new Progress<int>(d =>
@@ -560,8 +567,25 @@ public class MigrationJobService(SharePointService spService)
                         if (byIdentityInput.Count > 20 && (d % 100 == 0 || d == byIdentityInput.Count))
                             activityLog?.Report($"Fetching folder metadata: {d:N0} / {byIdentityInput.Count:N0}");
                     });
-                    folderMetadata = await spService.FetchFolderMetadataByIdentityAsync(
+                    var (byIdentityMetadata, byIdentityFailures) = await spService.FetchFolderMetadataByIdentityAsync(
                         byIdentityInput, maxConcurrency: 6, progress: byIdentityProgress, ct: cancellationToken);
+                    folderMetadata = byIdentityMetadata;
+                    if (unscannedAncestorPaths.Count > 0)
+                    {
+                        // Show ALL of them (not just a sample) while this is under active investigation
+                        // (2026-08-04) — whether the deepest entry (the job's own folder, added via
+                        // ownKey in CopyService) is present or absent among these tells us whether this
+                        // is an out-of-scope destination-path prefix (benign — those ancestor segments
+                        // were never part of this job's own scanned source tree, e.g. a manually
+                        // retargeted single-folder copy) or a genuine ownKey-registration bug.
+                        var unscannedExamples = string.Join(" | ", unscannedAncestorPaths.OrderBy(p => p.Length));
+                        activityLog?.Report($"⚠ {unscannedAncestorPaths.Count:N0} folder(s) had no identity from the scan (not a Graph failure) — they will show a placeholder date. Path(s): {unscannedExamples}");
+                    }
+                    if (byIdentityFailures.Count > 0)
+                    {
+                        var failureExamples = string.Join(" | ", byIdentityFailures.Take(3).Select(f => $"{f.FolderKey}: {f.Error}"));
+                        activityLog?.Report($"⚠ {byIdentityFailures.Count:N0} folder(s) failed the Graph metadata lookup — they will show a placeholder date. Example(s): {failureExamples}");
+                    }
                     // Root is a separate concern in both schemes — same call as the old path,
                     // just with an empty non-root list so only its dedicated root branch runs.
                     var rootOnly = await spService.FetchFolderMetadataAsync(
@@ -612,9 +636,16 @@ public class MigrationJobService(SharePointService spService)
                 // immediately in the log instead of only being discovered by eye in SharePoint later.
                 // Same formula shape as the old scheme (folderMetaInput.Count - folderMetadata.Count,
                 // where folderMetaInput always had exactly one entry per ancestor path).
-                int foldersMissingMetadata = allAncestorFolderPaths.Count - folderMetadata.Count;
-                if (foldersMissingMetadata > 0)
-                    activityLog?.Report($"⚠ {foldersMissingMetadata:N0} folder(s) could not be dated (Graph lookup failed after retries) — they will show a 2000-01-01 placeholder date instead of their real source date");
+                // Only reported here for the OLD SCHEME (scannedFolderIdentities == null): the new
+                // scheme above already breaks this same gap down into "never scanned" vs. "Graph
+                // lookup failed" — reporting the generic count again here would re-assert the wrong
+                // "after retries" framing for a folder that was never scanned at all.
+                if (scannedFolderIdentities == null)
+                {
+                    int foldersMissingMetadata = allAncestorFolderPaths.Count - folderMetadata.Count;
+                    if (foldersMissingMetadata > 0)
+                        activityLog?.Report($"⚠ {foldersMissingMetadata:N0} folder(s) could not be dated (Graph lookup failed after retries) — they will show a 2000-01-01 placeholder date instead of their real source date");
+                }
 
                 // Post-import correction: SPMI's <Folder> manifest element doesn't honor
                 // Author/ModifiedBy (confirmed 2026-07-08 — even a brand-new folder creation still
