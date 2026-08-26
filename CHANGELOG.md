@@ -4,6 +4,22 @@ All notable changes to SharePoint Smart Copy are documented here.
 
 ---
 
+## 3.5.2 — 2026-08-26
+
+### Added
+
+- **Migration API mode now applies custom column values** — previously this mode explicitly skipped custom columns for non-office files entirely and told the user to re-run in Enhanced REST mode to stamp them (the SPMI manifest's per-item `<Fields>` support had been removed earlier after it caused "Missing file info" import failures). A new post-import REST pass now applies custom columns after SPMI import completes, resolving each target item by its server-relative path since the migration API doesn't surface Graph item IDs for imported files — the same underlying mechanism Enhanced REST mode already used per file.
+- **Custom column failures are now visible instead of silently reported as "Success"** — a new "Custom Fields" status column (with its own Details column) appears in both the live Copy Log grid and the Copy Report grid, alongside a "Metadata Warnings" summary card on the Copy Report screen and a single end-of-run activity log line. A custom-field mismatch is tracked as its own amber "Warning" status, deliberately separate from the main Failed/Success status — the file itself still copied correctly, only some metadata didn't make it across, so treating it as a full copy failure would overstate the problem.
+
+### Fixed
+
+- **A single unreadable custom column emptied the entire bulk field cache for every file in the run** — `BulkReadCustomFieldsAsync` chunks columns into batches of 20 for one REST call each; if any one column in a batch wasn't actually selectable at the item level (observed with `_ExtendedDescription`, a field that appears in the fields list — not hidden, not read-only — but which SharePoint's item REST API rejects with "The field or property does not exist"), the whole batch's HTTP 400 wiped out every other column's values for every item, with the failure silently swallowed by the caller. The read now drops just the offending field and retries, and reports what was skipped instead of failing silently.
+- **A single mismatched custom column blocked every other column from being applied to the same item** — if a submitted field name doesn't exist on the *target* list (e.g. a column with the same display name on both libraries but a different auto-suffixed internal name — observed with a "Notes" column), `ValidateUpdateListItem` rejects the entire request with an HTTP 400, not just that one field. The write now drops just the offending column and retries with the rest, so one column mismatch no longer blocks otherwise-valid columns like Status, Count, or Owner from being written.
+- **A custom field silently absent from `ValidateUpdateListItem`'s response was reported as a successful copy** — SharePoint only returns an entry for fields applicable to the item's actual content type, so a submitted field for a column the content type doesn't include (e.g. a PDF assigned a different content type than Office files in the same library) was previously dropped from the response with no error, rather than flagged with `HasException`. A submitted field now missing from the response is treated as a failure.
+- **The "Custom Columns" checkbox didn't persist across sessions** — every other file-copy option (versions, permissions, preserve metadata, etc.) is restored from saved settings on startup; this one was saved on exit but never read back in, so it silently reset to unchecked every time the app was reopened.
+
+---
+
 ## 3.5.1 — 2026-08-04
 
 ### Changed

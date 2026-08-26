@@ -4241,7 +4241,7 @@ public class SharePointService
     // This key matches the listItemId returned by GetSharePointIdsAsync, enabling O(1) cache lookup per file.
     public async Task<Dictionary<string, Dictionary<string, object?>>> BulkReadCustomFieldsAsync(
         string siteUrl, string listId, IEnumerable<SpColumnDef> columns,
-        IProgress<int>? progress = null, CancellationToken ct = default)
+        IProgress<int>? progress = null, IProgress<string>? warningLog = null, CancellationToken ct = default)
     {
         var cols = columns.ToList();
         if (cols.Count == 0) return [];
@@ -4252,87 +4252,159 @@ public class SharePointService
 
         for (int chunk = 0; chunk < chunks.Count; chunk++)
         {
-            // User fields are lookups: they must be $expand-ed and read via {name}/Name
-            // (the claims login). Other field types are selected directly.
-            var selectParts = new List<string> { "ID" };
-            var expandParts = new List<string>();
-            foreach (var c in chunks[chunk])
+            // Mutable per-chunk column list: some fields exist in the fields collection (not
+            // Hidden, not ReadOnly) yet SharePoint's item-level REST rejects them with "The field
+            // or property 'X' does not exist" — e.g. '_ExtendedDescription', a phantom backing
+            // field observed 2026-08-26. A single such field previously poisoned the WHOLE chunk's
+            // request with an HTTP 400, silently emptying the bulk field cache for every item and
+            // every OTHER column in that chunk too. Now: on that specific error, drop the offending
+            // field from this chunk and retry, instead of losing the entire chunk.
+            var chunkCols = chunks[chunk].ToList();
+            var excludedFields = new List<string>();
+
+            while (chunkCols.Count > 0)
             {
-                if (SpColumnDef.IsUserType(c.FieldType))
+                // User fields are lookups: they must be $expand-ed and read via {name}/Name
+                // (the claims login). Other field types are selected directly.
+                var selectParts = new List<string> { "ID" };
+                var expandParts = new List<string>();
+                foreach (var c in chunkCols)
                 {
-                    selectParts.Add($"{c.InternalName}/Name");
-                    expandParts.Add(c.InternalName);
-                }
-                else if (SpColumnDef.IsLookupType(c.FieldType))
-                {
-                    selectParts.Add($"{c.InternalName}/LookupId");
-                    selectParts.Add($"{c.InternalName}/LookupValue");
-                    expandParts.Add(c.InternalName);
-                }
-                else
-                {
-                    selectParts.Add(c.InternalName);
-                }
-            }
-            var nextUrl = $"{siteUrl.TrimEnd('/')}/_api/web/lists('{listId}')/items" +
-                          $"?$select={Uri.EscapeDataString(string.Join(",", selectParts))}" +
-                          (expandParts.Count > 0 ? $"&$expand={Uri.EscapeDataString(string.Join(",", expandParts))}" : "") +
-                          "&$top=1000";
-
-            while (nextUrl != null)
-            {
-                ct.ThrowIfCancellationRequested();
-                using var response = await SendSharePointRequestAsync(token =>
-                {
-                    var r = new HttpRequestMessage(HttpMethod.Get, nextUrl);
-                    r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                    r.Headers.Accept.ParseAdd("application/json;odata=nometadata");
-                    return r;
-                }, siteUrl, cancellationToken: ct);
-
-                var body = await response.Content.ReadAsStringAsync(ct);
-                if (!response.IsSuccessStatusCode)
-                {
-                    // A failed page silently dropped every item beyond it from the bulk cache —
-                    // their files then copied with NO custom column values and reported Success.
-                    throw new HttpRequestException(
-                        $"Bulk custom-field read failed: HTTP {(int)response.StatusCode} — {body[..Math.Min(body.Length, 300)]}");
-                }
-
-                using var doc = JsonDocument.Parse(body);
-                var root = doc.RootElement;
-
-                if (root.TryGetProperty("value", out var items))
-                {
-                    foreach (var item in items.EnumerateArray())
+                    if (SpColumnDef.IsUserType(c.FieldType))
                     {
-                        if (!item.TryGetProperty("ID", out var idProp)) continue;
-                        var itemId = idProp.ValueKind == JsonValueKind.Number
-                            ? idProp.GetInt32().ToString()
-                            : idProp.GetString() ?? "";
-                        if (string.IsNullOrEmpty(itemId)) continue;
-
-                        if (!result.TryGetValue(itemId, out var fields))
-                        {
-                            fields = new Dictionary<string, object?>();
-                            result[itemId] = fields;
-                        }
-
-                        foreach (var col in chunks[chunk])
-                        {
-                            if (!item.TryGetProperty(col.InternalName, out var valProp)) continue;
-                            fields[col.InternalName] = ParseFieldValue(valProp, col.FieldType);
-                        }
+                        selectParts.Add($"{c.InternalName}/Name");
+                        expandParts.Add(c.InternalName);
+                    }
+                    else if (SpColumnDef.IsLookupType(c.FieldType))
+                    {
+                        selectParts.Add($"{c.InternalName}/LookupId");
+                        selectParts.Add($"{c.InternalName}/LookupValue");
+                        expandParts.Add(c.InternalName);
+                    }
+                    else
+                    {
+                        selectParts.Add(c.InternalName);
                     }
                 }
+                var nextUrl = $"{siteUrl.TrimEnd('/')}/_api/web/lists('{listId}')/items" +
+                              $"?$select={Uri.EscapeDataString(string.Join(",", selectParts))}" +
+                              (expandParts.Count > 0 ? $"&$expand={Uri.EscapeDataString(string.Join(",", expandParts))}" : "") +
+                              "&$top=1000";
 
-                nextUrl = GetNextLink(root);
+                bool retryWithFieldExcluded = false;
+                while (nextUrl != null)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    using var response = await SendSharePointRequestAsync(token =>
+                    {
+                        var r = new HttpRequestMessage(HttpMethod.Get, nextUrl);
+                        r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                        r.Headers.Accept.ParseAdd("application/json;odata=nometadata");
+                        return r;
+                    }, siteUrl, cancellationToken: ct);
+
+                    var body = await response.Content.ReadAsStringAsync(ct);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        var badField = TryExtractMissingFieldName(body);
+                        if (badField != null &&
+                            chunkCols.RemoveAll(c => string.Equals(c.InternalName, badField, StringComparison.OrdinalIgnoreCase)) > 0)
+                        {
+                            excludedFields.Add(badField);
+                            retryWithFieldExcluded = true;
+                            break;
+                        }
+
+                        // A failed page silently dropped every item beyond it from the bulk cache —
+                        // their files then copied with NO custom column values and reported Success.
+                        throw new HttpRequestException(
+                            $"Bulk custom-field read failed: HTTP {(int)response.StatusCode} — {body[..Math.Min(body.Length, 300)]}");
+                    }
+
+                    using var doc = JsonDocument.Parse(body);
+                    var root = doc.RootElement;
+
+                    if (root.TryGetProperty("value", out var items))
+                    {
+                        foreach (var item in items.EnumerateArray())
+                        {
+                            if (!item.TryGetProperty("ID", out var idProp)) continue;
+                            var itemId = idProp.ValueKind == JsonValueKind.Number
+                                ? idProp.GetInt32().ToString()
+                                : idProp.GetString() ?? "";
+                            if (string.IsNullOrEmpty(itemId)) continue;
+
+                            if (!result.TryGetValue(itemId, out var fields))
+                            {
+                                fields = new Dictionary<string, object?>();
+                                result[itemId] = fields;
+                            }
+
+                            foreach (var col in chunkCols)
+                            {
+                                if (!item.TryGetProperty(col.InternalName, out var valProp)) continue;
+                                fields[col.InternalName] = ParseFieldValue(valProp, col.FieldType);
+                            }
+                        }
+                    }
+
+                    nextUrl = GetNextLink(root);
+                }
+
+                if (!retryWithFieldExcluded) break;
             }
+
+            if (excludedFields.Count > 0)
+                warningLog?.Report($"⚠ {excludedFields.Count} custom column(s) could not be read and were skipped "
+                    + $"(not valid at the item level): {string.Join(", ", excludedFields)}");
 
             progress?.Report((chunk + 1) * 100 / chunks.Count);
         }
 
         return result;
+    }
+
+    // Parses "The field or property 'X' does not exist." out of a ValidateUpdateListItem/items()
+    // error body — used to drop a single phantom field from a bulk read instead of failing it whole.
+    private static string? TryExtractMissingFieldName(string body)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("odata.error", out var err) &&
+                err.TryGetProperty("message", out var msg) &&
+                msg.TryGetProperty("value", out var val))
+            {
+                var text = val.GetString() ?? "";
+                var m = System.Text.RegularExpressions.Regex.Match(text, @"The field or property '([^']+)' does not exist\.");
+                if (m.Success) return m.Groups[1].Value;
+            }
+        }
+        catch { /* not the expected error shape */ }
+        return null;
+    }
+
+    // Parses "Column 'X' does not exist. It may have been deleted by another user." out of a
+    // ValidateUpdateListItem error body — a different message shape than TryExtractMissingFieldName's,
+    // thrown when a submitted FieldName has no matching column on the TARGET list at all (e.g. source
+    // and target columns share a display name but not an internal name). Used to drop just that field
+    // and retry instead of failing every field on the item.
+    private static string? TryExtractNonexistentColumnName(string body)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("odata.error", out var err) &&
+                err.TryGetProperty("message", out var msg) &&
+                msg.TryGetProperty("value", out var val))
+            {
+                var text = val.GetString() ?? "";
+                var m = System.Text.RegularExpressions.Regex.Match(text, @"Column '([^']+)' does not exist\.");
+                if (m.Success) return m.Groups[1].Value;
+            }
+        }
+        catch { /* not the expected error shape */ }
+        return null;
     }
 
     private static object? ParseFieldValue(JsonElement el, SupportedFieldType type)
@@ -4455,20 +4527,75 @@ public class SharePointService
     {
         if (fields.Count == 0) return null;
 
-        var mappingLookup = SpColumnMap.BuildTargetNameMap(mappings);
-
         // Resolve target SharePoint IDs first so we can look up target column definitions
         // (needed to find the target lookup list GUID for Lookup/LookupMulti fields).
         var ids = await GetSharePointIdsAsync(driveId, itemId, ct)
             ?? throw new Exception($"Could not resolve SharePoint IDs for {driveId}/{itemId}");
 
+        return await ApplyFileCustomFieldsCoreAsync(ids.siteUrl, ids.listId, ids.listItemId, fields, mappings, ct);
+    }
+
+    // Same as ApplyFileCustomFieldsAsync, but resolves the target item via its REST server-relative
+    // path instead of Graph driveId/itemId. Used for the Migration API post-import custom-fields
+    // pass: SPMI-imported files have no Graph item ID to resolve (the migration API doesn't surface
+    // one — see the permissions post-pass in CopyService for the same constraint), only the
+    // server-relative path the file was imported to.
+    public async Task<string?> ApplyFileCustomFieldsByPathAsync(
+        string siteUrl, string listId, string serverRelativeUrl,
+        Dictionary<string, object?> fields,
+        IEnumerable<SpColumnMap> mappings,
+        CancellationToken ct = default)
+    {
+        if (fields.Count == 0) return null;
+
+        var listItemId = await GetFileListItemIdAsync(siteUrl, serverRelativeUrl, ct)
+            ?? throw new Exception($"Could not resolve list item ID for {serverRelativeUrl}");
+
+        return await ApplyFileCustomFieldsCoreAsync(siteUrl, listId, listItemId.ToString(), fields, mappings, ct);
+    }
+
+    // Returns a file's list item ID (not its UniqueId GUID) by server-relative path via REST.
+    // Mirrors the GetFolderById(...)/ListItemAllFields/Id pattern used for folders (see
+    // PatchFolderMetadataAsync) but resolves directly from a path in one round trip, matching
+    // GetFileUniqueIdAsync's *ByServerRelativePath approach so '#'/'%'/'+' in names are unaffected.
+    private async Task<int?> GetFileListItemIdAsync(string siteUrl, string serverRelativeUrl, CancellationToken ct = default)
+    {
+        var url = $"{siteUrl.TrimEnd('/')}/_api/web/GetFileByServerRelativePath({ServerRelativePathArg(serverRelativeUrl)})/ListItemAllFields/Id";
+        try
+        {
+            using var response = await SendSharePointRequestAsync(token =>
+            {
+                var r = new HttpRequestMessage(HttpMethod.Get, url);
+                r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                r.Headers.Accept.ParseAdd("application/json;odata=nometadata");
+                return r;
+            }, siteUrl, cancellationToken: ct);
+
+            if (!response.IsSuccessStatusCode) return null;
+            var body = await response.Content.ReadAsStringAsync(ct);
+            using var doc = JsonDocument.Parse(body);
+            return doc.RootElement.ValueKind == JsonValueKind.Number
+                ? doc.RootElement.GetInt32()
+                : doc.RootElement.TryGetProperty("value", out var v) ? v.GetInt32() : null;
+        }
+        catch { return null; }
+    }
+
+    private async Task<string?> ApplyFileCustomFieldsCoreAsync(
+        string siteUrl, string listId, string listItemId,
+        Dictionary<string, object?> fields,
+        IEnumerable<SpColumnMap> mappings,
+        CancellationToken ct)
+    {
+        var mappingLookup = SpColumnMap.BuildTargetNameMap(mappings);
+
         // Fetch target column defs (cached) to resolve lookup list GUIDs.
         List<SpColumnDef> targetCols;
-        try { targetCols = await GetLibraryColumnsAsync(ids.siteUrl, ids.listId); }
+        try { targetCols = await GetLibraryColumnsAsync(siteUrl, listId); }
         catch { targetCols = []; }
         var targetColsByName = targetCols.ToDictionary(c => c.InternalName, StringComparer.OrdinalIgnoreCase);
 
-        var formValues      = new List<object>();
+        var formValues      = new List<(string FieldName, string FieldValue)>();
         var submittedFields = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var lookupErrors    = new List<string>();
         foreach (var (srcName, value) in fields)
@@ -4500,7 +4627,7 @@ public class SharePointService
                 var resolvedIds = new List<int>();
                 foreach (var (_, display) in lookup.Entries)
                 {
-                    var targetId = await ResolveLookupValueAsync(ids.siteUrl, tgtCol.LookupListId, showField, display, ct);
+                    var targetId = await ResolveLookupValueAsync(siteUrl, tgtCol.LookupListId, showField, display, ct);
                     if (targetId.HasValue) resolvedIds.Add(targetId.Value);
                 }
 
@@ -4517,54 +4644,98 @@ public class SharePointService
                 var formatted = resolvedIds.Count == 1
                     ? resolvedIds[0].ToString()
                     : string.Join(";#;#", resolvedIds.Select(id => id.ToString())) + ";#";
-                formValues.Add(new { FieldName = targetName, FieldValue = formatted });
+                formValues.Add((targetName, formatted));
                 submittedFields.Add(targetName);
                 continue;
             }
 
             var formattedValue = FormatFieldValueForValidate(value);
-            formValues.Add(new { FieldName = targetName, FieldValue = formattedValue });
+            formValues.Add((targetName, formattedValue));
             submittedFields.Add(targetName);
         }
 
         if (formValues.Count == 0) return lookupErrors.Count > 0 ? $"Lookup unresolved: {string.Join(", ", lookupErrors)}" : null;
 
-        var url = $"{ids.siteUrl.TrimEnd('/')}/_api/web/lists('{ids.listId}')/items({ids.listItemId})/ValidateUpdateListItem()";
-        var payload = JsonSerializer.Serialize(new
-        {
-            formValues,
-            bNewDocumentUpdate = true,
-        });
+        var url = $"{siteUrl.TrimEnd('/')}/_api/web/lists('{listId}')/items({listItemId})/ValidateUpdateListItem()";
 
-        using var response = await SendSharePointRequestAsync(token =>
+        // A field name that's correct on SOURCE but doesn't exist on TARGET (e.g. columns that
+        // only look identical — same display name/values in the UI but a different internal name,
+        // observed 2026-08-26 with a "Notes" column) makes ValidateUpdateListItem reject the WHOLE
+        // request with a request-level 400 — unlike a content-type mismatch, which still returns
+        // 200 with per-field results. One bad field previously blocked every other valid field on
+        // the same item. Retry with that field dropped instead, same resilience pattern as
+        // BulkReadCustomFieldsAsync's phantom-field handling above.
+        var droppedFields = new List<string>();
+        string body;
+        while (true)
         {
-            var r = new HttpRequestMessage(HttpMethod.Post, url);
-            r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-            r.Headers.Accept.ParseAdd("application/json;odata=nometadata");
-            r.Content = new StringContent(payload, System.Text.Encoding.UTF8, "application/json");
-            return r;
-        }, ids.siteUrl, cancellationToken: ct);
+            var payload = JsonSerializer.Serialize(new
+            {
+                formValues = formValues.Select(f => new { f.FieldName, f.FieldValue }),
+                bNewDocumentUpdate = true,
+            });
 
-        var body = await response.Content.ReadAsStringAsync(ct);
-        if (!response.IsSuccessStatusCode)
-            return $"ApplyCustomFields HTTP {(int)response.StatusCode}";
+            using var response = await SendSharePointRequestAsync(token =>
+            {
+                var r = new HttpRequestMessage(HttpMethod.Post, url);
+                r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                r.Headers.Accept.ParseAdd("application/json;odata=nometadata");
+                r.Content = new StringContent(payload, System.Text.Encoding.UTF8, "application/json");
+                return r;
+            }, siteUrl, cancellationToken: ct);
+
+            body = await response.Content.ReadAsStringAsync(ct);
+            if (response.IsSuccessStatusCode) break;
+
+            var badColumn = TryExtractNonexistentColumnName(body);
+            if (badColumn != null &&
+                formValues.RemoveAll(f => string.Equals(f.FieldName, badColumn, StringComparison.OrdinalIgnoreCase)) > 0)
+            {
+                droppedFields.Add(badColumn);
+                submittedFields.Remove(badColumn);
+                if (formValues.Count == 0)
+                    return $"Custom field errors: {string.Join(", ", droppedFields.Select(n => $"{n} (column does not exist on target)"))}"
+                        + (lookupErrors.Count > 0 ? $"; Lookup unresolved: {string.Join(", ", lookupErrors)}" : "");
+                continue;
+            }
+
+            // Body included (not just the status code) so an unrecognized 400 still names the actual
+            // rejected field/reason in the activity log instead of just "HTTP 400". Payload/values are
+            // deliberately NOT echoed here — the response body is SharePoint's own error text, but the
+            // outgoing payload can contain the submitted field values themselves.
+            return $"ApplyCustomFields HTTP {(int)response.StatusCode} — {body[..Math.Min(body.Length, 500)]}";
+        }
 
         // ValidateUpdateListItem returns an entry for every field in the list definition,
         // including read-only system fields (Created, Modified, etc.) that always report
         // HasException=true.  Only surface errors for fields we actually submitted.
         var fieldErrors = new List<string>(lookupErrors.Select(n => $"{n} (lookup unresolved)"));
+        fieldErrors.AddRange(droppedFields.Select(n => $"{n} (column does not exist on target)"));
         try
         {
             using var doc = JsonDocument.Parse(body);
             if (doc.RootElement.TryGetProperty("value", out var vals))
             {
+                var returnedFields = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var v in vals.EnumerateArray())
                 {
-                    if (!v.TryGetProperty("HasException", out var ex) || !ex.GetBoolean()) continue;
                     if (!v.TryGetProperty("FieldName", out var fn)) continue;
                     var name = fn.GetString() ?? "";
+                    returnedFields.Add(name);
+                    if (!v.TryGetProperty("HasException", out var ex) || !ex.GetBoolean()) continue;
                     if (submittedFields.Contains(name))
                         fieldErrors.Add(name);
+                }
+
+                // A field we submitted can be silently absent from the response — e.g. the item's
+                // content type doesn't include that field (common when the target library assigns a
+                // different content type to certain file types, such as PDFs vs. Office documents).
+                // ValidateUpdateListItem never reports this as HasException, so without this check
+                // the copy is reported as fully successful while the value was never written.
+                foreach (var name in submittedFields)
+                {
+                    if (!returnedFields.Contains(name))
+                        fieldErrors.Add($"{name} (not applicable to item's content type)");
                 }
             }
         }

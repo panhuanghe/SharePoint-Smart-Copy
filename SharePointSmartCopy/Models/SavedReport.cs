@@ -20,6 +20,10 @@ public class SavedReportItem
     public CopyStatus? PermissionStatus { get; set; }
     public string? PermissionDetails { get; set; }
 
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public CopyStatus? CustomFieldStatus { get; set; }
+    public string? CustomFieldDetails { get; set; }
+
     [JsonIgnore]
     public string StatusDisplay => Status switch
     {

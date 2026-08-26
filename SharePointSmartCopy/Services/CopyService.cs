@@ -613,10 +613,8 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
             int migrationMaxVersions = copyVersions ? maxVersions : 1;
             // The SPMI manifest no longer carries per-item <Fields> (standalone SPListItem objects
             // caused "Missing file info" import failures — see MigrationPackageBuilder), so custom
-            // column values cannot be applied by this mode. Say so instead of silently ignoring the
-            // option.
-            if (copyCustomColumns)
-                activityLog?.Report("⚠ Custom column values are not applied in Migration API mode — after this run, re-run in Enhanced REST mode with Copy-If-Newer to stamp custom columns");
+            // column values can't be applied as part of the import itself. Instead they're applied
+            // in a REST post-import pass below, the same mechanism Enhanced REST mode uses per file.
             await migrationJobService.ExecuteAsync(allTasks, overwriteMode, migrationMaxVersions, maxParallel, cancellationToken,
                 copyCustomColumns, columnMappings, bulkFieldCache, preflightProgress, activityLog, onFilePacked,
                 reapplyFolderMetadata: preserveMetadata && reapplyFolderMetadata,
@@ -672,6 +670,62 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                     catch { /* non-fatal */ }
                 });
             }
+
+            // Custom columns: same constraint and pattern as the permissions pass above — the
+            // migration API doesn't surface Graph item IDs for imported files, so each target item
+            // is resolved via its REST server-relative path (ApplyFileCustomFieldsByPathAsync)
+            // instead of the Graph-based ApplyFileCustomFieldsAsync that Enhanced REST mode uses.
+            if (copyCustomColumns && bulkFieldCache != null && columnMappings != null && bulkFieldCache.Count > 0)
+            {
+                var fieldCandidates = allTasks.Where(t =>
+                    t.result.Status == CopyStatus.Success ||
+                    (t.result.Status == CopyStatus.Skipped && t.result.ErrorMessage == CopyResult.UpToDate)).ToList();
+
+                if (fieldCandidates.Count > 0)
+                {
+                    activityLog?.Report($"Applying custom column values to {fieldCandidates.Count:N0} file(s)...");
+                    // Target listId is the same for every file in a given target library — resolve
+                    // it once per distinct (site, library) pair rather than once per file.
+                    var targetListIdCache = new System.Collections.Concurrent.ConcurrentDictionary<string, Task<string>>();
+
+                    await Parallel.ForEachAsync(fieldCandidates,
+                        new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = cancellationToken },
+                        async (t, ct) =>
+                    {
+                        var (job, result) = t;
+                        try
+                        {
+                            var srcIds = await spService.GetSharePointIdsAsync(job.SourceDriveId, job.SourceItemId);
+                            if (!srcIds.HasValue) return;
+                            var cacheKey = $"{srcIds.Value.listId}:{srcIds.Value.listItemId}";
+                            if (!bulkFieldCache.TryGetValue(cacheKey, out var customFields) || customFields.Count == 0)
+                                return;
+
+                            var sub = job.TargetSubFolderPath?.Trim('/');
+                            var tgtRelUrl = string.IsNullOrEmpty(sub)
+                                ? $"{job.TargetLibraryServerRelativeUrl}/{job.SourceName}"
+                                : $"{job.TargetLibraryServerRelativeUrl.TrimEnd('/')}/{sub}/{job.SourceName}";
+
+                            var listIdKey = $"{job.TargetSiteUrl}|{job.TargetLibraryServerRelativeUrl}";
+                            var targetListId = await targetListIdCache.GetOrAdd(listIdKey,
+                                _ => spService.GetListIdByServerRelativeUrlAsync(job.TargetSiteUrl, job.TargetLibraryServerRelativeUrl));
+
+                            var cfErr = await spService.ApplyFileCustomFieldsByPathAsync(
+                                job.TargetSiteUrl, targetListId, tgtRelUrl, customFields, columnMappings, ct);
+                            result.CustomFieldStatus  = cfErr != null ? CopyStatus.Failed : CopyStatus.Success;
+                            result.CustomFieldDetails = cfErr;
+                            if (cfErr != null) result.ErrorMessage ??= cfErr;
+                        }
+                        catch (OperationCanceledException) { throw; }
+                        catch (Exception ex)
+                        {
+                            result.CustomFieldStatus  = CopyStatus.Failed;
+                            result.CustomFieldDetails = ex.Message;
+                            result.ErrorMessage ??= $"Custom fields: {ex.Message}";
+                        }
+                    });
+                }
+            }
         }
         else
         {
@@ -690,6 +744,15 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                 async (t, ct) => await CopySingleFileAsync(t.job, t.result, overwriteMode, copyVersions, maxVersions, controller, ct,
                     copyCustomColumns, columnMappings, bulkFieldCache, copyPages, remapPageWebPartUrls, preserveMetadata,
                     copyPermissions, permissionService, permissionFlags, permissionResults: results));
+        }
+
+        // One combined summary regardless of copy mode — both modes set CustomFieldStatus per row
+        // above (Migration API via the post-import REST pass, Enhanced REST via CopySingleFileAsync).
+        if (copyCustomColumns)
+        {
+            int customFieldFailures = allTasks.Count(t => t.result.CustomFieldStatus == CopyStatus.Failed);
+            if (customFieldFailures > 0)
+                activityLog?.Report($"⚠ Custom column values could not be fully applied for {customFieldFailures:N0} file(s) — see the Custom Fields column for details");
         }
 
         // SPMI already stamps folder timestamps via the manifest's TimeLastModified / TimeCreated /
@@ -1104,6 +1167,8 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
                 {
                     var cfErr = await spService.ApplyFileCustomFieldsAsync(
                         job.TargetDriveId, targetItemId, customFields, columnMappings, ct);
+                    result.CustomFieldStatus  = cfErr != null ? CopyStatus.Failed : CopyStatus.Success;
+                    result.CustomFieldDetails = cfErr;
                     if (cfErr != null) result.ErrorMessage ??= cfErr;
                 }
             }
@@ -1250,6 +1315,8 @@ public class CopyService(SharePointService spService, MigrationJobService migrat
             {
                 var cfErr = await spService.ApplyFileCustomFieldsAsync(
                     job.TargetDriveId, targetItemId, customFields, columnMappings);
+                result.CustomFieldStatus  = cfErr != null ? CopyStatus.Failed : CopyStatus.Success;
+                result.CustomFieldDetails = cfErr;
                 if (cfErr != null) result.ErrorMessage ??= cfErr;
 
                 // ValidateUpdateListItem bumps Modified/Editor — re-stamp the final

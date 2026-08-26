@@ -2,7 +2,7 @@
 
 *Copy files and folders between SharePoint Online sites*
 
-**Version 3.5.1  ·  August 2026**
+**Version 3.5.2  ·  August 2026**
 
 ---
 
@@ -32,8 +32,9 @@ Two copy engines are available. **Migration API** mode uses SharePoint's server-
 - **Migration API mode** — exact version numbers, exact dates, exact editors (requires Site Collection Admin on target)
 - **Enhanced REST mode** — correct dates and editors per version; no admin rights required
 - **Copy-if-newer** incremental mode — only copies files that are newer on the source, skipping files already up to date
-- **Person/User, Managed Metadata, and Lookup columns** copied alongside content — no manual field re-entry
+- **Person/User, Managed Metadata, and Lookup columns** copied alongside content in both copy modes — no manual field re-entry
 - Custom column mapping dialog — map source columns to matching target columns or create missing ones
+- **Custom Fields status column** flags any column value that couldn't be written (e.g. a target column that looks identical but doesn't actually match by internal name), so a partial metadata mismatch is never mistaken for a fully clean copy
 - Automatic HTTP 429 throttle handling — large jobs complete without interruption
 - Parallel transfers with 1–16 simultaneous file copies for faster bulk operations
 - Real-time progress monitoring with per-file status updates (Enhanced REST) or job-level results (Migration API)
@@ -411,6 +412,7 @@ Connect a **Source** and a **Target** independently, the same way you would in t
 - **Path too long** — SharePoint Online has a 400-character limit on the full URL path. Shorten folder names or use a shallower structure.
 - **Throttling (429 Too Many Requests)** — the Microsoft Graph API rate-limits heavy usage. The application retries automatically, but very large batches may take longer.
 - **"SharePoint aborted the batch after N name conflicts" in the activity log (Migration API mode)** — this is expected automatic recovery, not a failure. SharePoint's Migration API cancels an entire import batch once enough files at the destination already exist, which would otherwise discard every other valid file in that batch. With **Skip existing** selected, the app marks the conflicting files Skipped (matching what Skip means) and resubmits the rest once. With **Overwrite** or **If newer**, the app clears the conflicting targets and resubmits the whole batch once. If a retry still fails, the affected files are reported individually in the final results — re-running the copy again typically clears them, since a fresh pre-flight scan re-detects the current state of the target.
+- **A file shows "⚠ Warning" in the Custom Fields column** — the file itself copied successfully; only one or more custom column values could not be written. Check the Custom Fields Details column for the reason. The most common cause is a target column that looks identical to its source counterpart (same display name and values elsewhere) but doesn't actually share the same internal name — SharePoint auto-suffixes a column's internal name at creation time if it collides with another field, so "Notes" on the source and "Notes" on the target can silently be different fields underneath. Open the Column Mapping dialog and confirm the source column is mapped to the target's real internal name (visible in **Library Settings** → click the column → the `Field=` value in the URL), rather than relying on the display name to match automatically.
 
 ### Version history not copying
 

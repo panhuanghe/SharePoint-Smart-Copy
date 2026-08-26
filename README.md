@@ -44,7 +44,7 @@ Choose from four copy scopes in a step-by-step wizard:
 | **Pages** | Modern SharePoint pages (.aspx), with optional web part URL remapping |
 
 **All scopes:**
-- Custom column values copied — including **Person/User**, **Managed Metadata**, and **Lookup** columns
+- Custom column values copied in both **Migration API** and **Enhanced REST** modes — including **Person/User**, **Managed Metadata**, and **Lookup** columns
 - Custom column mapping dialog — map source columns to target columns, or create missing columns in the target
 - Overwrite / skip / **copy-if-newer** incremental mode
 - **Adaptive throttle handling** — each Graph-heavy phase backs off and re-probes independently, so large jobs complete without manual intervention or stalling on shared throttle state
@@ -68,6 +68,7 @@ Choose from four copy scopes in a step-by-step wizard:
 - **OneNote notebooks copy correctly** — copied as a single native server-side operation instead of being rebuilt file-by-file, preserving the special notebook association that would otherwise be lost
 
 **Copy log:**
+- **Custom column mismatches are surfaced, not hidden** — a dedicated Custom Fields status column, a Metadata Warnings summary count, and an end-of-run log line flag any value that couldn't be written (e.g. a target column that doesn't actually match by internal name), without marking the file's own copy as failed
 - Filter chips — All / Success / Failed / Skipped — on both the progress and report screens
 - Scales to 100,000+ files without UI freeze — batched row rendering and coalesced auto-scroll
 - Default report/verification filenames are prefixed with the source and target site names, including OneDrive personal sites (e.g. `Marketing-Archive-CopyReport_Files_...csv`) — can be turned off in Settings

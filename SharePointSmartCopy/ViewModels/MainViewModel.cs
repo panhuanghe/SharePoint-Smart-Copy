@@ -67,6 +67,7 @@ public partial class MainViewModel : ObservableObject
         CopyLibraryContent  = Settings.CopyLibraryContent;
         RemapPageWebPartUrls = Settings.RemapPageWebPartUrls;
         CopyPermissions      = Settings.CopyPermissions;
+        CopyCustomColumns    = Settings.CopyCustomColumns;
         DeepVerifyOfficeFiles = Settings.DeepVerifyOfficeFiles;
 
         SourceLibraries.CollectionChanged += (_, _) =>
@@ -551,6 +552,8 @@ public partial class MainViewModel : ObservableObject
     [NotifyPropertyChangedFor(nameof(LibrarySummaryCount))]
     [NotifyPropertyChangedFor(nameof(LibraryPreviewItems))]
     [NotifyPropertyChangedFor(nameof(EffectiveCopyCustomColumns))]
+    [NotifyPropertyChangedFor(nameof(CustomFieldColumnWidth))]
+    [NotifyPropertyChangedFor(nameof(CustomFieldDetailsColumnWidth))]
     [NotifyPropertyChangedFor(nameof(ShowFileCopyOptions))]
     [NotifyCanExecuteChangedFor(nameof(NextCommand))]
     private CopyScope _copyScope = CopyScope.Files;
@@ -643,6 +646,8 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(EffectiveCopyCustomColumns))]
     [NotifyPropertyChangedFor(nameof(CanConfigureMappings))]
+    [NotifyPropertyChangedFor(nameof(CustomFieldColumnWidth))]
+    [NotifyPropertyChangedFor(nameof(CustomFieldDetailsColumnWidth))]
     private bool _copyCustomColumns = false;
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(ShowFileCopyOptions))]
@@ -752,6 +757,12 @@ public partial class MainViewModel : ObservableObject
     private int _successTally, _failedTally, _skippedTally, _cancelledTally;
     private int _fileTotalTally, _fileSuccessTally, _fileFailedTally, _fileSkippedTally, _fileCancelledTally;
 
+    // Deliberately NOT folded into _fileFailedTally (unlike PermissionStatus==Failed — see
+    // UpdateFileFailedTally): a custom-field mismatch means the file itself copied fine, only some
+    // metadata didn't make it across, so it's tracked as its own independent count rather than
+    // counting the whole file as failed.
+    private int _customFieldWarningTally;
+
     // Byte-weighted counterparts of the tallies above, for ETA — see UpdateProgress. Kept alongside
     // the item counts (not replacing them) because several flows (library/site copy, permissions)
     // create CopyResult rows with no meaningful SourceSize; ETA falls back to item-count for those.
@@ -790,6 +801,7 @@ public partial class MainViewModel : ObservableObject
             case NotifyCollectionChangedAction.Reset:
                 _successTally = _failedTally = _skippedTally = _cancelledTally = 0;
                 _fileTotalTally = _fileSuccessTally = _fileFailedTally = _fileSkippedTally = _fileCancelledTally = 0;
+                _customFieldWarningTally = 0;
                 _bytesTotalTally = _bytesDoneTally = 0;
                 _bytesMissingCount = 0;
                 _bytesFinalTally = 0;
@@ -799,8 +811,9 @@ public partial class MainViewModel : ObservableObject
 
     private void AttachRowTallies(CopyResult row)
     {
-        row.StatusChanging           += OnRowStatusChanging;
-        row.PermissionStatusChanging += OnRowPermissionStatusChanging;
+        row.StatusChanging            += OnRowStatusChanging;
+        row.PermissionStatusChanging  += OnRowPermissionStatusChanging;
+        row.CustomFieldStatusChanging += OnRowCustomFieldStatusChanging;
         if (!row.IsPermissionResult)
             Interlocked.Increment(ref _fileTotalTally);
         if (row.SourceSize is long size)
@@ -815,12 +828,15 @@ public partial class MainViewModel : ObservableObject
         OnRowStatusChanging(row, CopyStatus.Pending, row.Status);
         if (row.PermissionStatus != null)
             OnRowPermissionStatusChanging(row, null, row.PermissionStatus);
+        if (row.CustomFieldStatus != null)
+            OnRowCustomFieldStatusChanging(row, null, row.CustomFieldStatus);
     }
 
     private void DetachRowTallies(CopyResult row)
     {
-        row.StatusChanging           -= OnRowStatusChanging;
-        row.PermissionStatusChanging -= OnRowPermissionStatusChanging;
+        row.StatusChanging            -= OnRowStatusChanging;
+        row.PermissionStatusChanging  -= OnRowPermissionStatusChanging;
+        row.CustomFieldStatusChanging -= OnRowCustomFieldStatusChanging;
         if (!row.IsPermissionResult)
             Interlocked.Decrement(ref _fileTotalTally);
         if (row.SourceSize is long size)
@@ -830,6 +846,8 @@ public partial class MainViewModel : ObservableObject
         OnRowStatusChanging(row, row.Status, CopyStatus.Pending);
         if (row.PermissionStatus != null)
             OnRowPermissionStatusChanging(row, row.PermissionStatus, null);
+        if (row.CustomFieldStatus != null)
+            OnRowCustomFieldStatusChanging(row, row.CustomFieldStatus, null);
     }
 
     private void OnRowStatusChanging(CopyResult row, CopyStatus oldStatus, CopyStatus newStatus)
@@ -850,6 +868,13 @@ public partial class MainViewModel : ObservableObject
     {
         if (!row.IsPermissionResult)
             UpdateFileFailedTally(row, row.Status, newValue);
+    }
+
+    // Independent of UpdateFileFailedTally on purpose — see _customFieldWarningTally's doc comment.
+    private void OnRowCustomFieldStatusChanging(CopyResult row, CopyStatus? oldValue, CopyStatus? newValue)
+    {
+        if (oldValue == CopyStatus.Failed) Interlocked.Decrement(ref _customFieldWarningTally);
+        if (newValue == CopyStatus.Failed) Interlocked.Increment(ref _customFieldWarningTally);
     }
 
     // FileFailedCount is Status==Failed OR PermissionStatus==Failed — tracked as one combined flag
@@ -1185,6 +1210,11 @@ public partial class MainViewModel : ObservableObject
     public int FileSkippedCount   => _fileSkippedTally;
     public int FileCancelledCount => _fileCancelledTally;
 
+    // Files that copied successfully but had at least one custom column value that could not be
+    // applied (mismatched/missing target column, content-type mismatch, etc.) — see
+    // CopyResult.CustomFieldStatus. Deliberately not part of FileFailedCount.
+    public int CustomFieldWarningCount => _customFieldWarningTally;
+
     // Total/copied-so-far size for display, reusing the same byte tallies ShouldUseBytesEta already
     // maintains for the ETA calculation. Blank whenever too many rows are missing a SourceSize (same
     // threshold as ShouldUseBytesEta) — showing a partial byte sum next to a complete item count
@@ -1206,6 +1236,9 @@ public partial class MainViewModel : ObservableObject
 
     public double PermColumnWidth        => CopyPermissions ? 100 : 0;
     public double PermDetailsColumnWidth => CopyPermissions ? 200 : 0;
+
+    public double CustomFieldColumnWidth        => EffectiveCopyCustomColumns ? 100 : 0;
+    public double CustomFieldDetailsColumnWidth => EffectiveCopyCustomColumns ? 200 : 0;
 
     [RelayCommand]
     private async Task StartCopyAsync()
@@ -1326,11 +1359,17 @@ public partial class MainViewModel : ObservableObject
                             var srvUrl = await SpService.GetLibraryServerRelativeUrlAsync(driveId);
                             var listId = await SpService.GetListIdByServerRelativeUrlAsync(SourceUrl.TrimEnd('/'), srvUrl);
                             var cols   = await SpService.GetLibraryColumnsAsync(SourceUrl.TrimEnd('/'), listId);
-                            var cache  = await SpService.BulkReadCustomFieldsAsync(SourceUrl.TrimEnd('/'), listId, cols, ct: _copyCts.Token);
+                            var cache  = await SpService.BulkReadCustomFieldsAsync(SourceUrl.TrimEnd('/'), listId, cols, warningLog: onActivity, ct: _copyCts.Token);
                             foreach (var (itemId, fields) in cache)
                                 _bulkFieldCache[$"{listId}:{itemId}"] = fields;
                         }
-                        catch { /* non-critical — that library's custom columns are skipped */ }
+                        catch (Exception ex)
+                        {
+                            // Surfaced rather than silently swallowed — a failed bulk read here used to
+                            // leave the whole custom-field cache empty with no visible reason, so every
+                            // file in the run silently copied with no custom column values at all.
+                            PushActivity($"⚠ Reading custom column values failed for this library: {ex.Message}");
+                        }
                     }
                 }
 
@@ -1447,6 +1486,7 @@ public partial class MainViewModel : ObservableObject
             OnPropertyChanged(nameof(FileFailedCount));
             OnPropertyChanged(nameof(FileSkippedCount));
             OnPropertyChanged(nameof(FileCancelledCount));
+            OnPropertyChanged(nameof(CustomFieldWarningCount));
             SaveReport();
 
             if (IsUpdatingMetadata)
@@ -2458,6 +2498,7 @@ public partial class MainViewModel : ObservableObject
             OnPropertyChanged(nameof(FileFailedCount));
             OnPropertyChanged(nameof(FileSkippedCount));
             OnPropertyChanged(nameof(FileCancelledCount));
+            OnPropertyChanged(nameof(CustomFieldWarningCount));
             SaveReport();
         }
     }
@@ -2744,6 +2785,7 @@ public partial class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(FileSuccessCount));
         OnPropertyChanged(nameof(FileFailedCount));
         OnPropertyChanged(nameof(FileSkippedCount));
+        OnPropertyChanged(nameof(CustomFieldWarningCount));
         OnPropertyChanged(nameof(HasKnownTotalSize));
         OnPropertyChanged(nameof(TotalSizeDisplay));
         OnPropertyChanged(nameof(DoneSizeDisplay));
@@ -2788,6 +2830,7 @@ public partial class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(FileSuccessCount));
         OnPropertyChanged(nameof(FileFailedCount));
         OnPropertyChanged(nameof(FileSkippedCount));
+        OnPropertyChanged(nameof(CustomFieldWarningCount));
         OnPropertyChanged(nameof(HasKnownTotalSize));
         OnPropertyChanged(nameof(TotalSizeDisplay));
         OnPropertyChanged(nameof(DoneSizeDisplay));
@@ -3053,6 +3096,8 @@ public partial class MainViewModel : ObservableObject
                     IsPermissionResult = r.IsPermissionResult,
                     PermissionStatus   = r.PermissionStatus,
                     PermissionDetails  = r.PermissionDetails,
+                    CustomFieldStatus  = r.CustomFieldStatus,
+                    CustomFieldDetails = r.CustomFieldDetails,
                 }).ToList(),
                 Roots = CopyJobs.Select(j => new SavedReportRoot
                 {

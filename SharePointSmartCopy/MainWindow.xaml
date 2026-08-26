@@ -1515,6 +1515,19 @@
                                 <GridViewColumn Header="Permissions Details"
                                     Width="{Binding DataContext.PermDetailsColumnWidth, RelativeSource={RelativeSource AncestorType=Window}}"
                                     DisplayMemberBinding="{Binding PermissionDetails}"/>
+                                <GridViewColumn Header="Custom Fields"
+                                    Width="{Binding DataContext.CustomFieldColumnWidth, RelativeSource={RelativeSource AncestorType=Window}}">
+                                    <GridViewColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding CustomFieldStatusDisplay}"
+                                                       Foreground="{Binding CustomFieldStatusColor}"
+                                                       FontSize="12"/>
+                                        </DataTemplate>
+                                    </GridViewColumn.CellTemplate>
+                                </GridViewColumn>
+                                <GridViewColumn Header="Custom Fields Details"
+                                    Width="{Binding DataContext.CustomFieldDetailsColumnWidth, RelativeSource={RelativeSource AncestorType=Window}}"
+                                    DisplayMemberBinding="{Binding CustomFieldDetails}"/>
                             </GridView>
                         </ListView.View>
                     </ListView>
@@ -1531,8 +1544,8 @@
 
                 <TextBlock Grid.Row="0" Text="Copy Report" Style="{StaticResource SectionHeader}"/>
 
-                <UniformGrid Grid.Row="1" Columns="4" Margin="0,0,0,12"
-                             HorizontalAlignment="Left" MaxWidth="900">
+                <UniformGrid Grid.Row="1" Columns="5" Margin="0,0,0,12"
+                             HorizontalAlignment="Left" MaxWidth="1125">
                     <Border Style="{StaticResource SummaryCard}" Background="{DynamicResource SuccessBgBrush}" BorderBrush="{DynamicResource SuccessBrush}">
                         <StackPanel>
                             <TextBlock Text="{Binding SuccessCount}" FontSize="28" FontWeight="Bold"
@@ -1552,6 +1565,13 @@
                             <TextBlock Text="{Binding SkippedCount}" FontSize="28" FontWeight="Bold"
                                        Foreground="{DynamicResource WarningTextBrush}" HorizontalAlignment="Center"/>
                             <TextBlock Text="Skipped" Foreground="{DynamicResource WarningTextBrush}" HorizontalAlignment="Center" FontSize="13"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Style="{StaticResource SummaryCard}" Background="{DynamicResource WarningBgBrush}" BorderBrush="{DynamicResource WarningBrush}">
+                        <StackPanel>
+                            <TextBlock Text="{Binding CustomFieldWarningCount}" FontSize="28" FontWeight="Bold"
+                                       Foreground="{DynamicResource WarningTextBrush}" HorizontalAlignment="Center"/>
+                            <TextBlock Text="Metadata Warnings" Foreground="{DynamicResource WarningTextBrush}" HorizontalAlignment="Center" FontSize="13"/>
                         </StackPanel>
                     </Border>
                     <Border Style="{StaticResource SummaryCard}" Background="{DynamicResource WindowBgBrush}" BorderBrush="{DynamicResource BorderLightBrush}" Margin="0">
@@ -1715,6 +1735,19 @@
                                 <DataGridTextColumn Header="Permissions Details"
                                     Binding="{Binding PermissionDetails}"
                                     Width="{Binding DataContext.PermDetailsColumnWidth, RelativeSource={RelativeSource AncestorType=Window}}"/>
+                                <DataGridTemplateColumn Header="Custom Fields" SortMemberPath="CustomFieldStatus"
+                                    Width="{Binding DataContext.CustomFieldColumnWidth, RelativeSource={RelativeSource AncestorType=Window}}">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding CustomFieldStatusDisplay}" Margin="4,2"
+                                                       Foreground="{Binding CustomFieldStatusColor}"
+                                                       FontWeight="SemiBold" FontSize="12"/>
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                                <DataGridTextColumn Header="Custom Fields Details"
+                                    Binding="{Binding CustomFieldDetails}"
+                                    Width="{Binding DataContext.CustomFieldDetailsColumnWidth, RelativeSource={RelativeSource AncestorType=Window}}"/>
                             </DataGrid.Columns>
                         </DataGrid>
                     </Border>

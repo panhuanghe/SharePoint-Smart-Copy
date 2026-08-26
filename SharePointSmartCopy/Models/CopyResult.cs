@@ -82,6 +82,19 @@ public partial class CopyResult : ObservableObject
 
     [ObservableProperty] private string? _permissionDetails;
 
+    // Set only when a custom-column value was actually attempted for this row (copyCustomColumns
+    // on AND the source item had at least one cached field value) — null otherwise, same "not
+    // attempted" convention as PermissionStatus. Failed here means at least one submitted column
+    // could not be written (mismatched/missing target column, content-type mismatch, etc.) — the
+    // FILE itself still copied fine, so this is deliberately a separate signal from Status/Failed
+    // rather than folded into it.
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CustomFieldStatusDisplay))]
+    [NotifyPropertyChangedFor(nameof(CustomFieldStatusColor))]
+    private CopyStatus? _customFieldStatus;
+
+    [ObservableProperty] private string? _customFieldDetails;
+
     // Raised synchronously on whatever thread sets the property (often a background copy/permission
     // worker) so a listener can maintain O(1) incremental tallies instead of rescanning the whole
     // result set on every UI tick — see MainViewModel's SuccessCount/FailedCount/etc., which used to
@@ -93,6 +106,9 @@ public partial class CopyResult : ObservableObject
 
     public event Action<CopyResult, CopyStatus?, CopyStatus?>? PermissionStatusChanging;
     partial void OnPermissionStatusChanging(CopyStatus? oldValue, CopyStatus? newValue) => PermissionStatusChanging?.Invoke(this, oldValue, newValue);
+
+    public event Action<CopyResult, CopyStatus?, CopyStatus?>? CustomFieldStatusChanging;
+    partial void OnCustomFieldStatusChanging(CopyStatus? oldValue, CopyStatus? newValue) => CustomFieldStatusChanging?.Invoke(this, oldValue, newValue);
 
     // FileFailedCount counts Status==Failed OR PermissionStatus==Failed as one thing; this remembers
     // which side of that OR last drove the count so a listener can detect the combined predicate's
@@ -133,6 +149,23 @@ public partial class CopyResult : ObservableObject
         CopyStatus.Success => "#107C10",
         CopyStatus.Failed  => "#A4262C",
         CopyStatus.Skipped => "#797775",
+        _                  => "#797775"
+    };
+
+    // "Warning" rather than "Failed" for the display text: a custom-field mismatch means the FILE
+    // still copied successfully — only some metadata values didn't make it across — so labeling it
+    // the same as a hard copy failure would overstate the severity.
+    public string CustomFieldStatusDisplay => CustomFieldStatus switch
+    {
+        CopyStatus.Success => "✅ Applied",
+        CopyStatus.Failed  => "⚠ Warning",
+        _                  => "—"
+    };
+
+    public string CustomFieldStatusColor => CustomFieldStatus switch
+    {
+        CopyStatus.Success => "#107C10",
+        CopyStatus.Failed  => "#C19C00",
         _                  => "#797775"
     };
 }
